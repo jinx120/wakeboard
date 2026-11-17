@@ -41,7 +41,9 @@ def mount_extras(app: FastAPI, service: Service, auth: AuthStore) -> None:
 
 
 def create_app(settings: Settings | None = None, *, prober=None, poller: Poller | None = None,
-               **service_kw) -> FastAPI:
+               actions_kw: dict | None = None, **service_kw) -> FastAPI:
+    """Build the app. ``prober``/``poller``/``actions_kw`` (Actions sleep/clock/wol) and
+    ``service_kw`` (Service local_ips/resolve/...) are test seams; production passes none."""
     settings = settings or Settings.from_env()
     conn = connect(settings.data_dir / "wakeboard.db")
 
@@ -59,7 +61,7 @@ def create_app(settings: Settings | None = None, *, prober=None, poller: Poller 
     keystore.ensure_global()
     runner = HostKeyAckRunner(SshRunner(keystore, settings.data_dir / "known_hosts"), repo)
     prober = prober or Prober()
-    actions = Actions(runner, prober, settings)  # the ONE shared instance (per-device locks)
+    actions = Actions(runner, prober, settings, **(actions_kw or {}))  # the ONE shared instance (per-device locks)
     state: dict[str, bool] = {}
     service = Service(repo, audit, actions, runner, prober, state, lock=db_lock, **service_kw)
     poller = poller or Poller()
