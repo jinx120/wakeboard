@@ -1,0 +1,416 @@
+"""Service facade: confirm / self rules, auditing, error degradation. All fakes."""
+import pytest
+
+from wakeboard.actions import ActionResult, StageResult
+from wakeboard.audit import AuditLog
+from wakeboard.devices import Device, DeviceRepo
+from wakeboard.service import (MAX_OUTPUT, ConfirmationRequired, HostKeyAckRunner,
+                               InvalidRequest, RunCommandDisabled, SelfTargetRefused, Service,
+                               detect_self)
+from wakeboard.ssh import ConnectFailed, HostKeyChanged, RunResult, SudoRequired
+from wakeboard.status import Info
+from wakeboard.targets import NoDevices, UnknownTarget
+from wakeboard.wolcheck import WolReport
+
+
+class FakeActions:
+    def __init__(self):
+        self.calls: list[tuple] = []
+        self.raise_for: dict[str, Exception] = {}
+
+    async def _go(self, action, device, **kw):
+        self.calls.append((action, device.name, kw))
+        if device.name in self.raise_for:
+            raise self.raise_for[device.name]
+        return ActionResult(ok=True, stages=[StageResult(action, True, f"{action} done")])
+
+    async def wake(self, device, progress=None):
+        return await self._go("wake", device)
+
+    async def shutdown(self, device, mode=None, progress=None):
+        return await self._go("shutdown", device, mode=mode)
+
+    async def reboot(self, device, progress=None):
+        return await self._go("reboot", device)
+
+
+class FakeRunner:
+    def __init__(self):
+        self.calls: list[tuple[str, str]] = []
+        self.result = RunResult("hello\n", "", 0)
+        self.exc: Exception | None = None
+        self.acked: list[str] = []
+
+    async def run(self, device, cmd, timeout=30):
+        self.calls.append((device.name, cmd))
+        if self.exc:
+            raise self.exc
+        return self.result
+
+    def acknowledge_host_key(self, device):
+        self.acked.append(device.name)
+
+
+class FakeProber:
+    def __init__(self, up=True):
+        self.up = up
+
+    async def is_up(self, device):
+        return self.up
+
+
+@pytest.fixture
+def repo(conn):
+    r = DeviceRepo(conn)
+    r.add(Device(name="pve1", host="10.0.0.1", type="proxmox", groups=["lab"], mac="aa:bb:cc:00:00:01"))
+    r.add(Device(name="pve2", host="10.0.0.2", type="proxmox", groups=["lab"], mac="aa:bb:cc:00:00:02"))
+    r.add(Device(name="pi", host="10.0.0.9", groups=["lab"], is_self=True, mac="aa:bb:cc:00:00:09"))
+    return r
+
+
+@pytest.fixture
+def audit(conn):
+    return AuditLog(conn)
+
+
+@pytest.fixture
+def actions():
+    return FakeActions()
+
+
+@pytest.fixture
+def runner():
+    return FakeRunner()
+
+
+def make_service(repo, audit, actions, runner, local=("127.0.0.1",), prober=None, state=None,
+                 **kw):
+    return Service(repo, audit, actions, runner, prober or FakeProber(),
+                   state if state is not None else {},
+                   local_ips=lambda: set(local), resolve=lambda host: set(), **kw)
+
+
+@pytest.fixture
+def svc(repo, audit, actions, runner):
+    return make_service(repo, audit, actions, runner)
+
+
+# ---- confirmation / self rules ----------------------------------------------
+
+async def test_shutdown_all_without_confirm_raises(svc, actions, audit):
+    with pytest.raises(ConfirmationRequired) as ei:
+        await svc.shutdown("all", caller="api")
+    msg = str(ei.value)
+    assert "pve1" in msg and "pve2" in msg
+    assert actions.calls == []
+    rows = audit.list()
+    assert rows[0]["caller"] == "api" and rows[0]["action"] == "shutdown"
+    assert "refused" in rows[0]["result"]
+
+
+async def test_shutdown_group_without_confirm_raises(svc, actions):
+    with pytest.raises(ConfirmationRequired):
+        await svc.shutdown("lab", caller="ui")
+    with pytest.raises(ConfirmationRequired):
+        await svc.reboot("LAB", caller="ui")
+    assert actions.calls == []
+
+
+async def test_shutdown_all_skips_self_device(svc, actions):
+    res = await svc.shutdown("all", caller="ui", confirm=True)
+    assert set(res) == {"pve1", "pve2"}
+    assert all(v["ok"] for v in res.values())
+    assert sorted(c[1] for c in actions.calls) == ["pve1", "pve2"]
+
+
+async def test_group_shutdown_and_reboot_skip_self_device(svc, actions):
+    res = await svc.shutdown("lab", caller="ui", confirm=True)
+    assert set(res) == {"pve1", "pve2"}
+    res = await svc.reboot("lab", caller="ui", confirm=True)
+    assert set(res) == {"pve1", "pve2"}
+    assert "pi" not in {c[1] for c in actions.calls}
+
+
+async def test_shutdown_self_requires_confirm_with_warning(svc, actions):
+    with pytest.raises(SelfTargetRefused) as ei:
+        await svc.shutdown("pi", caller="ui")
+    assert "WARNING" in str(ei.value) and "pi" in str(ei.value)
+    assert isinstance(ei.value, ConfirmationRequired)
+    with pytest.raises(SelfTargetRefused):
+        await svc.reboot("pi", caller="ui")
+    assert actions.calls == []
+    res = await svc.shutdown("pi", caller="ui", confirm=True)
+    assert res["pi"]["ok"] and actions.calls == [("shutdown", "pi", {"mode": None})]
+
+
+async def test_single_non_self_shutdown_needs_no_confirm(svc, actions):
+    res = await svc.shutdown("pve1", caller="ui", mode="plain")
+    assert res["pve1"]["ok"]
+    assert res["pve1"]["stages"] == [{"stage": "shutdown", "ok": True, "detail": "shutdown done"}]
+    assert actions.calls == [("shutdown", "pve1", {"mode": "plain"})]
+
+
+async def test_invalid_shutdown_mode_rejected(svc, actions):
+    with pytest.raises(InvalidRequest):
+        await svc.shutdown("pve1", caller="ui", mode="yank-the-cord")
+    assert actions.calls == []
+
+
+async def test_detected_self_host_requires_confirm_and_is_excluded_from_bulk(repo, audit, actions, runner):
+    repo.add(Device(name="hv", host="192.168.1.50", groups=["lab"], mac="aa:bb:cc:00:00:50"))
+    svc = make_service(repo, audit, actions, runner, local=("127.0.0.1", "192.168.1.50"))
+    with pytest.raises(SelfTargetRefused) as ei:
+        await svc.reboot("hv", caller="ui")
+    assert "WARNING" in str(ei.value)
+    res = await svc.shutdown("all", caller="ui", confirm=True)
+    assert set(res) == {"pve1", "pve2"}
+    with pytest.raises(ConfirmationRequired) as ei:
+        await svc.shutdown("lab", caller="ui")
+    assert "hv" in str(ei.value)  # named as excluded
+    assert not repo.get("hv").is_self  # never persisted
+    listed = {d["name"]: d for d in await svc.list_devices()}
+    assert listed["hv"]["is_self"] is True
+
+
+async def test_unknown_target_and_no_devices(repo, audit, actions, runner, svc):
+    with pytest.raises(UnknownTarget):
+        await svc.shutdown("nope", caller="ui")
+    with pytest.raises(UnknownTarget):
+        await svc.wake("nope", caller="ui")
+    for name in ("pve1", "pve2"):
+        repo.remove(name)
+    with pytest.raises(NoDevices):
+        await svc.shutdown("all", caller="ui", confirm=True)
+    assert actions.calls == []
+
+
+def test_detect_self_matches_local_ips_and_names():
+    devs = [Device(name="a", host="10.0.0.1"), Device(name="b", host="LOCALHOST"),
+            Device(name="c", host="myhv.lan"), Device(name="d", host="10.0.0.2"),
+            Device(name="e", host="::1")]
+    resolve = {"localhost": {"127.0.0.1"}, "myhv.lan": {"10.0.0.7"}}
+    got = detect_self(devs, local_ips=lambda: {"10.0.0.7", "127.0.0.1", "::1"},
+                      resolve=lambda h: resolve.get(h.lower(), set()))
+    assert got == {"b", "c", "e"}
+
+
+def test_detect_self_default_local_ips_include_loopback():
+    got = detect_self([Device(name="lo", host="127.0.0.1")], resolve=lambda h: set())
+    assert got == {"lo"}
+
+
+# ---- wake --------------------------------------------------------------------
+
+async def test_wake_without_mac_fails_clearly(repo, svc, actions):
+    repo.add(Device(name="nomac", host="10.0.0.3"))
+    res = await svc.wake("nomac", caller="ui")
+    assert res["nomac"]["ok"] is False
+    assert "no MAC configured; run wake_check to discover one" in res["nomac"]["error"]
+    assert actions.calls == []
+
+
+async def test_wake_group_runs_without_confirm(svc, actions):
+    res = await svc.wake("lab", caller="ui")
+    assert set(res) == {"pve1", "pve2"}
+
+
+# ---- run_command -------------------------------------------------------------
+
+async def test_run_command_disabled_by_default(svc, runner, audit):
+    with pytest.raises(RunCommandDisabled):
+        await svc.run_command("pve1", "uptime", caller="mcp")
+    assert runner.calls == []
+    row = audit.list()[0]
+    assert row["caller"] == "mcp" and row["action"] == "run_command" and "refused" in row["result"]
+
+
+async def test_run_command_rejects_bulk_target(svc, repo, runner):
+    for t in ("all", "lab"):
+        with pytest.raises(InvalidRequest):
+            await svc.run_command(t, "uptime", caller="api")
+    with pytest.raises(UnknownTarget):
+        await svc.run_command("nope", "uptime", caller="api")
+    assert runner.calls == []
+
+
+async def test_run_command_returns_truncated_output(svc, repo, runner):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    runner.result = RunResult("x" * (MAX_OUTPUT + 10), "e" * 5, 3)
+    res = await svc.run_command("pve1", "cat big", caller="api")
+    assert runner.calls == [("pve1", "cat big")]
+    assert len(res["stdout"]) == MAX_OUTPUT and res["stderr"] == "eeeee"
+    assert res["exit"] == 3 and res["truncated"] is True and res["ok"] is False
+
+
+async def test_run_command_connect_failure_is_a_result(svc, repo, runner):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    runner.exc = ConnectFailed("connect to root@10.0.0.1:22 timed out after 30s")
+    res = await svc.run_command("pve1", "uptime", caller="api")
+    assert res["ok"] is False and "timed out" in res["error"]
+
+
+# ---- auditing ----------------------------------------------------------------
+
+async def test_every_action_audited_with_caller(svc, repo, audit, monkeypatch):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+
+    async def fake_wol_check(runner, device):
+        return WolReport(nic="eno1", mac=device.mac, supported=True, current_flags="g",
+                         persistent=True, notes=[])
+    svc._wol_check = fake_wol_check
+
+    await svc.wake("pve1", caller="mcp")
+    await svc.shutdown("pve1", caller="mcp")
+    await svc.reboot("pve1", caller="mcp")
+    await svc.wake_check("pve1", caller="mcp")
+    await svc.run_command("pve1", "uptime", caller="mcp")
+    with pytest.raises(ConfirmationRequired):
+        await svc.reboot("all", caller="mcp")
+    rows = list(reversed(audit.list()))
+    assert [r["action"].split()[0] for r in rows] == [
+        "wake", "shutdown", "reboot", "wake_check", "run_command", "reboot"]
+    assert all(r["caller"] == "mcp" for r in rows)
+    assert rows[0]["target"] == "pve1" and rows[0]["result"].startswith("ok")
+    assert rows[-1]["target"] == "all" and "refused" in rows[-1]["result"]
+    assert "uptime" in rows[4]["action"] + rows[4]["result"]
+
+
+async def test_failed_action_audited_as_fail(svc, actions, audit):
+    actions.raise_for["pve2"] = HostKeyChanged("host key for [10.0.0.2]:22 changed")
+    res = await svc.shutdown("lab", caller="ui", confirm=True)
+    assert res["pve1"]["ok"] is True
+    assert res["pve2"]["ok"] is False and "host key" in res["pve2"]["error"]
+    rows = {r["target"]: r["result"] for r in audit.list()}
+    assert rows["pve2"].startswith("fail") and "host key" in rows["pve2"]
+    assert rows["pve1"].startswith("ok")
+
+
+async def test_unexpected_exception_becomes_failed_result(svc, actions):
+    actions.raise_for["pve1"] = SudoRequired("sudo needs a password")
+    res = await svc.reboot("pve1", caller="ui")
+    assert res["pve1"]["ok"] is False and "sudo" in res["pve1"]["error"]
+    actions.raise_for["pve1"] = RuntimeError("boom")
+    res = await svc.reboot("pve1", caller="ui")
+    assert res["pve1"]["ok"] is False and "boom" in res["pve1"]["error"]
+
+
+# ---- status / wake_check degrade ----------------------------------------------
+
+INFO = Info(uptime_s=100, load1=0.5, mem_used_pct=10.0, disk_root_pct=20.0, cpu_temp_c=None,
+            kernel="6.8", pve_version=None, vms_running=None, cts_running=None, fetched_at=1.0)
+
+
+async def test_device_status_up_with_info_and_caches(repo, audit, actions, runner):
+    calls = []
+
+    async def collect(r, d):
+        calls.append(d.name)
+        return INFO
+    state = {}
+    svc = make_service(repo, audit, actions, runner, state=state, collect_info=collect)
+    res = await svc.device_status("pve1")
+    assert res["pve1"]["status"] == "up" and res["pve1"]["info"]["uptime_s"] == 100
+    await svc.device_status("pve1")
+    assert calls == ["pve1"]  # second call served from cache
+    assert state["pve1"] is True
+    listed = {d["name"]: d for d in await svc.list_devices()}
+    assert listed["pve1"]["up"] is True and listed["pve1"]["info"]["kernel"] == "6.8"
+
+
+async def test_device_status_degrades_to_unreachable(repo, audit, actions, runner):
+    async def collect(r, d):
+        raise ConnectFailed("connect to root@10.0.0.1:22 failed: refused")
+    svc = make_service(repo, audit, actions, runner, collect_info=collect)
+    res = await svc.device_status("pve1")
+    assert res["pve1"]["status"] == "unreachable" and "refused" in res["pve1"]["error"]
+
+
+async def test_device_status_down(repo, audit, actions, runner):
+    svc = make_service(repo, audit, actions, runner, prober=FakeProber(up=False))
+    res = await svc.device_status("pve1")
+    assert res["pve1"]["status"] == "down" and res["pve1"]["info"] is None
+
+
+async def test_wake_check_degrades_and_adopts_mac(repo, audit, actions, runner):
+    repo.add(Device(name="nomac", host="10.0.0.3"))
+
+    async def wol(r, d):
+        if d.name == "pve1":
+            raise ConnectFailed("connect to root@10.0.0.1:22 failed: no route")
+        return WolReport(nic="eno1", mac="aa:bb:cc:dd:ee:ff", supported=True, current_flags="g",
+                         persistent=False, notes=["not persistent"])
+    svc = make_service(repo, audit, actions, runner)
+    svc._wol_check = wol
+    res = await svc.wake_check("pve1", caller="ui")
+    assert res["pve1"]["ok"] is False and res["pve1"]["status"] == "unreachable"
+    res = await svc.wake_check("nomac", caller="ui")
+    assert res["nomac"]["ok"] is True and res["nomac"]["mac_adopted"] is True
+    assert res["nomac"]["report"]["nic"] == "eno1" and res["nomac"]["ready"] is False
+    assert repo.get("nomac").mac == "aa:bb:cc:dd:ee:ff"
+
+
+# ---- list_devices ----------------------------------------------------------------
+
+async def test_list_devices_has_state_and_no_secrets(repo, audit, actions, runner):
+    d = repo.get("pve1")
+    d.key_id = "pve1key"
+    repo.update(d)
+    svc = make_service(repo, audit, actions, runner, state={"pve1": True, "pve2": False})
+    out = {d["name"]: d for d in await svc.list_devices()}
+    assert out["pve1"]["up"] is True and out["pve2"]["up"] is False and out["pi"]["up"] is None
+    assert out["pi"]["is_self"] is True
+    assert out["pve1"]["info"] is None
+    for d in out.values():
+        assert "key_id" not in d and "id" not in d
+        assert "password" not in str(d).lower()
+
+
+# ---- host key acknowledge ------------------------------------------------------
+
+async def test_acknowledge_sets_flag_and_first_success_clears_it(repo, audit, actions, runner):
+    wrapped = HostKeyAckRunner(runner, repo)
+    svc = make_service(repo, audit, actions, wrapped)
+    await svc.acknowledge_host_key("pve1", caller="ui")
+    assert runner.acked == ["pve1"] and repo.get("pve1").host_key_ack is True
+    assert audit.list()[0]["action"] == "acknowledge_host_key"
+    runner.exc = ConnectFailed("down")
+    with pytest.raises(ConnectFailed):
+        await wrapped.run(repo.get("pve1"), "true")
+    assert repo.get("pve1").host_key_ack is True  # failed connect keeps the ack
+    runner.exc = None
+    dev = repo.get("pve1")
+    await wrapped.run(dev, "true")
+    assert repo.get("pve1").host_key_ack is False and dev.host_key_ack is False
+    with pytest.raises(UnknownTarget):
+        await svc.acknowledge_host_key("nope", caller="ui")
+
+
+# ---- wake_test --------------------------------------------------------------------
+
+async def test_wake_test_refuses_self_and_bulk(svc, actions, audit):
+    res = await svc.wake_test("pi", caller="ui")
+    assert res["pi"]["ok"] is False and "host Wakeboard runs on" in res["pi"]["stages"][0]["detail"]
+    assert audit.list()[0]["action"] == "wake_test"
+    with pytest.raises(InvalidRequest):
+        await svc.wake_test("lab", caller="ui")
+    assert actions.calls == []
+
+
+async def test_detected_self_never_persisted_via_wake_check(repo, audit, actions, runner):
+    repo.add(Device(name="hv", host="192.168.1.50"))
+
+    async def wol(r, d):
+        return WolReport(nic="eno1", mac="aa:bb:cc:dd:ee:50", supported=True, current_flags="g",
+                         persistent=True, notes=[])
+    svc = make_service(repo, audit, actions, runner, local=("192.168.1.50",))
+    svc._wol_check = wol
+    res = await svc.wake_check("hv", caller="ui")
+    assert res["hv"]["mac_adopted"] is True
+    saved = repo.get("hv")
+    assert saved.mac == "aa:bb:cc:dd:ee:50" and saved.is_self is False
