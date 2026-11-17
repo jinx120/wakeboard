@@ -1,6 +1,9 @@
 services:
   wakeboard:
-    image: ghcr.io/OWNER/wakeboard:latest   # replace OWNER, or use `build: .`
+    # `docker compose pull && docker compose up -d` uses the published image;
+    # `docker compose up -d --build` builds it from this repo instead.
+    image: ghcr.io/jinx120/wakeboard:latest
+    build: .
     container_name: wakeboard
     restart: unless-stopped
     # Host networking: Wake-on-LAN broadcasts and ping must reach the LAN directly.

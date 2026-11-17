@@ -30,14 +30,14 @@ see `src/wakeboard/web/static/VENDORED.txt`. The UI loads nothing from external 
    sudo usermod -aG docker "$USER"   # log out and back in
    ```
 
-4. Create a directory with a `docker-compose.yml`. Copy the one from this repo and
-   replace `OWNER` in the image name with the GitHub owner that publishes the image:
+4. Create a directory with a `docker-compose.yml`. Copy the one from this repo; it uses
+   the published image `ghcr.io/jinx120/wakeboard:latest`:
 
    ```sh
    mkdir -p ~/wakeboard && cd ~/wakeboard
    # copy docker-compose.yml here
    echo 'WAKEBOARD_PASSWORD=change-me-to-something-long' > .env
-   docker compose up -d
+   docker compose pull && docker compose up -d
    ```
 
 The compose file uses `network_mode: host`, which lets WoL broadcasts and ping reach the
@@ -45,13 +45,14 @@ LAN. It keeps all state in `./data` (mounted at `/data`): the SQLite database, W
 SSH keys and its `known_hosts`. Back up that directory and keep it private.
 
 The container runs as root because it needs raw-socket ping and host networking, and its
-SSH keys live under `/data`. The image is published as `ghcr.io/<owner>/wakeboard` for
-`linux/arm64` and `linux/amd64` (see `.github/workflows/image.yml`). To build it yourself
-instead, replace `image:` with `build: .` and run `docker compose up -d --build`.
+SSH keys live under `/data`. The image is published as `ghcr.io/jinx120/wakeboard` for
+`linux/arm64` and `linux/amd64` (see `.github/workflows/image.yml`). The compose file also
+has `build: .`, so in a checkout of this repo `docker compose up -d --build` builds the
+image locally instead.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `WAKEBOARD_PASSWORD` | unset | Initial UI password. Used only if no password is set yet. |
+| `WAKEBOARD_PASSWORD` | unset | Initial UI password (at least 8 characters; a shorter one is ignored with a logged error). Used only if no password is set yet. |
 | `WAKEBOARD_PORT` | `8080` | HTTP port (uvicorn binds `0.0.0.0`). |
 | `WAKEBOARD_DATA` | `/data` | State directory. |
 
@@ -93,7 +94,9 @@ Then enroll Wakeboard's SSH key on the device. The device page offers two method
 
 On first contact Wakeboard pins the device's SSH host key. If the key later changes (for
 example after a reinstall), every connection is refused until you press **Acknowledge changed
-host key** on the device page.
+host key** on the device page. The next connection to the device (any action, sudo
+check or password enrollment) pins the new key and clears the acknowledgement, so a
+further key change is refused again.
 
 ## Enabling Wake-on-LAN on a node
 
@@ -136,9 +139,12 @@ sudo tailscale serve --bg 8080
 
 Once requests arrive over HTTPS, cookies are marked `Secure`. Use the HTTPS URL for the UI
 and MCP clients. Plain HTTP on `:8080` stays open on the LAN (the container binds
-`0.0.0.0`), so firewall it if the LAN is not trusted. Behind `tailscale serve`, every client
-reaches Wakeboard from `127.0.0.1`, so the per-IP login lockout applies to all of them
-together.
+`0.0.0.0`), so firewall it if the LAN is not trusted. `tailscale serve` connects from
+`127.0.0.1` and sets `X-Forwarded-For`; uvicorn trusts that header from `127.0.0.1` only
+(its default `--forwarded-allow-ips`), so each tailnet client is identified by its own
+address and the per-IP login lockout applies to each one separately. Clients on the LAN
+cannot spoof the header. Any local process on the Wakeboard host can, so do not run
+untrusted software there.
 
 > **Do not use `tailscale funnel`.** Funnel publishes the service to the whole internet.
 > Wakeboard can power off your machines, and its only protection is a password and a
@@ -163,12 +169,18 @@ Tools: `list_devices`, `device_status`, `wake`, `shutdown`, `reboot`, `wake_chec
   list to the human and ask before it re-sends with `confirm=true`. The web UI shows a
   confirmation step.
 - **Self exclusion.** A "self" device is the machine Wakeboard runs on, or the host it
-  runs inside: one marked "self" by hand, or one whose address is a local or loopback
-  address. Self devices are always excluded from groups and `all`. To shut down or reboot
+  runs inside: one marked "self" by hand, or one whose address is a loopback address or
+  any address assigned to one of this machine's interfaces (LAN, `tailscale0`, Docker
+  bridges..., read from `/proc/net`; the container uses host networking, so it sees the
+  host's interfaces). A hypervisor that runs Wakeboard inside a VM has its own addresses
+  and is **not** detected: mark it "self" by hand on its device page. Self devices are
+  always excluded from groups and `all`. To shut down or reboot
   one, name it explicitly with `confirm=true`. Wakeboard cannot wake its own host, and the
   wake test refuses to run on it.
-- **Audit first.** The intent of every action is recorded *before* it runs. If the audit
-  log cannot be written, the action is refused (`503`).
+- **Audit first.** The intent of every shutdown, reboot, wake test and `run_command` is
+  recorded *before* it runs. If the audit log cannot be written, the action is refused
+  (`503`). Wake and WoL check (which cannot power anything off) and refusals are
+  audited after the fact; a failure to write those rows is logged and does not block.
 - **Graceful Proxmox shutdown** stops running VMs/CTs first (`qm|pct shutdown <id>
   --timeout <s>`, then `qm|pct stop <id> --overrule-shutdown 1` for stragglers). The host
   is shut down only when no guest is still running.
@@ -177,6 +189,14 @@ Tools: `list_devices`, `device_status`, `wake`, `shutdown`, `reboot`, `wake_chec
   on a non-critical node first.
 - `run_command` is off per device unless you enable it. Secrets in commands are redacted
   in the audit log.
+
+## Known limitations
+
+- **Timeouts are not configurable.** There is no settings UI (or environment variable)
+  for them; the defaults are a 300 s wake timeout, 120 s per-guest shutdown timeout,
+  300 s host shutdown timeout and 30 s status poll interval.
+- **One SSH key for all devices.** Wakeboard generates a single global key pair and
+  enrolls it on every device; generating a separate key per device is not supported.
 
 ## Development
 
