@@ -15,8 +15,10 @@ _UNAUTHORIZED = HTTPException(status_code=401, detail="unauthorized",
 
 
 def client_ip(request) -> str:
-    """The trusted TCP peer address. Never X-Forwarded-For or other headers:
-    those are client-controlled and would let a caller dodge the login lockout."""
+    """The client address as uvicorn reports it. Never read X-Forwarded-For here:
+    it is client-controlled and would let a caller dodge the login lockout.
+    (uvicorn itself substitutes X-Forwarded-For only for peers in its
+    --forwarded-allow-ips, default 127.0.0.1, e.g. `tailscale serve`.)"""
     client = getattr(request, "client", None)
     return client.host if client and client.host else "unknown"
 

@@ -156,6 +156,14 @@ def test_create_app_env_password_only_applied_when_unset(tmp_path, monkeypatch):
     assert app.state.auth.check_password("first-password", "127.0.0.1")
 
 
+def test_create_app_env_password_too_short_is_ignored(tmp_path, monkeypatch, caplog):
+    from wakeboard import main
+    monkeypatch.setenv("WAKEBOARD_PASSWORD", "short7!")
+    app = main.create_app(Settings(data_dir=tmp_path))
+    assert not app.state.auth.password_set()
+    assert "at least 8" in caplog.text and "short7!" not in caplog.text
+
+
 def test_docs_and_openapi_disabled(tmp_path):
     from wakeboard import main
     app = main.create_app(Settings(data_dir=tmp_path))

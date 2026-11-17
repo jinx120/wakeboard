@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader
 
 from wakeboard.api import client_ip
-from wakeboard.auth import SESSION_MAX_AGE, LockedOut
+from wakeboard.auth import MIN_PASSWORD, SESSION_MAX_AGE, LockedOut
 from wakeboard.devices import (NAME_RE, RESERVED_NAMES, VALID_SHUTDOWN_MODES, VALID_TYPES, Device,
                                DuplicateDevice, UnknownDevice, valid_name)
 from wakeboard.service import (AuditUnavailable, ConfirmationRequired, InvalidRequest,
@@ -34,7 +34,6 @@ CALLER = "ui"
 SESSION_COOKIE = "wakeboard_session"
 ANON_COOKIE = "wakeboard_csrf"          # pre-login CSRF nonce (login / setup forms)
 PUBLIC_PATHS = {"/login", "/setup"}
-MIN_PASSWORD = 8
 AUDIT_LIMIT = 200
 HISTORY_LIMIT = 50
 
@@ -325,7 +324,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         pw = str(form.get("password", "") or "")
         anon = request.cookies[ANON_COOKIE]    # guard checked it exists
         try:
-            ok = auth.check_password(pw, client_ip(request))
+            ok = await auth.check_password_async(pw, client_ip(request))
         except LockedOut as e:
             return render(request, "login.html", 429, anon=anon, headers={"Retry-After": str(e.retry_after)},
                           error=f"Too many failed attempts. Try again in {e.retry_after} seconds.")
@@ -592,12 +591,12 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
     async def settings_page(request: Request):
         return render(request, "settings.html", **settings_ctx())
 
-    def check_current(request: Request, form, err_key: str) -> HTMLResponse | None:
+    async def check_current(request: Request, form, err_key: str) -> HTMLResponse | None:
         """Re-check the current password (under lockout); None when it is right."""
         cur = form.get("current")
         cur = cur if isinstance(cur, str) else ""
         try:
-            ok = bool(cur) and auth.check_password(cur, client_ip(request))
+            ok = bool(cur) and await auth.check_password_async(cur, client_ip(request))
         except LockedOut as e:
             return render(request, "settings.html", 429, headers={"Retry-After": str(e.retry_after)},
                           **{err_key: f"Too many failed attempts. Try again in {e.retry_after} seconds."},
@@ -612,7 +611,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         form = await request.form()
         op = form.get("op")
         if op == "rotate_token":
-            denied = check_current(request, form, "token_error")
+            denied = await check_current(request, form, "token_error")
             if denied is not None:
                 return denied
             token = auth.rotate_token()
@@ -620,7 +619,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
             return render(request, "settings.html", new_token=token, **settings_ctx())
         if op == "password":
             new, new2 = str(form.get("new", "") or ""), str(form.get("confirm", "") or "")
-            denied = check_current(request, form, "pw_error")
+            denied = await check_current(request, form, "pw_error")
             if denied is not None:
                 return denied
             if len(new) < MIN_PASSWORD:

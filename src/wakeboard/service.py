@@ -98,29 +98,16 @@ class LockedAudit:
         return getattr(self._inner, name)
 
 
-class HostKeyAckRunner:
-    """Runner wrapper: the first successful run on a device whose changed host key
-    was acknowledged clears its host_key_ack flag, so a later key change is
-    refused again instead of being silently re-pinned."""
-
-    def __init__(self, inner, repo):
-        self._inner, self._repo = inner, repo
-
-    async def run(self, device: Device, cmd: str, timeout: float = 30):
-        r = await self._inner.run(device, cmd, timeout)
-        if device.host_key_ack:
-            device.host_key_ack = False
-            try:
-                fresh = self._repo.get(device.name)
-                if fresh is not None and fresh.host_key_ack:
-                    fresh.host_key_ack = False
-                    self._repo.update(fresh)
-            except Exception:
-                log.exception("clearing host_key_ack for %s failed", device.name)
-        return r
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
+def host_key_ack_clearer(repo) -> Callable[[Device], None]:
+    """SshRunner on_repin hook: persist host_key_ack=False once the acknowledged key
+    is pinned, so a later key change is refused again instead of silently re-pinned."""
+    def clear(device: Device) -> None:
+        with getattr(repo, "lock", None) or contextlib.nullcontext():
+            fresh = repo.get(device.name)
+            if fresh is not None and fresh.host_key_ack:
+                fresh.host_key_ack = False
+                repo.update(fresh)
+    return clear
 
 
 # ---- self detection -------------------------------------------------------------
@@ -135,9 +122,46 @@ def _norm_ip(s: str) -> str | None:
     return str(ip)
 
 
+_FIB_TRIE = "/proc/net/fib_trie"
+_IF_INET6 = "/proc/net/if_inet6"
+
+
+def interface_ips(fib_trie=_FIB_TRIE, if_inet6=_IF_INET6) -> set[str]:
+    """Every address assigned to a local interface (LAN, tailscale0, docker bridges,
+    ...), read from procfs. IPv4: entries marked "/32 host LOCAL" in fib_trie (routed
+    peers and broadcast entries are skipped). IPv6: every address in if_inet6.
+    Missing or unreadable files (non-Linux) yield nothing."""
+    ips: set[str] = set()
+    try:
+        prev = None
+        for ln in open(fib_trie, encoding="ascii", errors="replace"):
+            t = ln.strip()
+            if t.startswith("|--"):
+                prev = t[3:].strip()
+            elif prev and t.startswith("/32 host LOCAL"):
+                ips.add(prev)
+    except OSError:
+        pass
+    try:
+        for ln in open(if_inet6, encoding="ascii", errors="replace"):
+            h = ln.split(None, 1)[0] if ln.strip() else ""
+            if len(h) == 32:
+                try:
+                    ips.add(str(ipaddress.IPv6Address(int(h, 16))))
+                except ValueError:
+                    pass
+    except OSError:
+        pass
+    return {i for i in ips if _norm_ip(i)}
+
+
 def default_local_ips() -> set[str]:
-    """IPs of this machine, via the socket module only (no extra dependency)."""
-    ips = {"127.0.0.1", "::1"}
+    """IPs of this machine: every interface address (procfs), plus hostname lookup
+    and the primary outbound address per family as fallbacks.
+
+    With host networking the container sees the host's interfaces. A hypervisor
+    that runs Wakeboard inside a VM is NOT detectable: mark it "self" by hand."""
+    ips = {"127.0.0.1", "::1"} | interface_ips()
     name = socket.gethostname()
     try:
         for info in socket.getaddrinfo(name, None):
@@ -315,14 +339,16 @@ class Service:
         except Exception:
             log.exception("audit write failed (%s %s %s)", caller, target, action)
 
-    def _audit_attempt(self, caller, target, action, confirm, devices) -> None:
+    def _audit_attempt(self, caller, target, action, confirm, devices, detail: str = "") -> None:
         # Written BEFORE the action: if it takes Wakeboard's own host down, the
         # intent is still on record even though no result row will follow.
-        # Fails CLOSED: no record, no action.
+        # Fails CLOSED: no record, no action. confirm=None: the action takes no confirm.
         names = ",".join(d.name for d in devices)
+        text = "attempt:" + (f" confirm={confirm}" if confirm is not None else "") + f" targets={names}"
+        if detail:
+            text += f" | {detail}"
         try:
-            self.audit.record(caller, str(target)[:200], action,
-                              f"attempt: confirm={confirm} targets={names}"[:_AUDIT_MAX])
+            self.audit.record(caller, str(target)[:200], action, text[:_AUDIT_MAX])
         except Exception as e:
             log.error("pre-action audit write failed; refusing %s of %s: %s", action, target, _err(e))
             raise AuditUnavailable(
@@ -515,6 +541,8 @@ class Service:
         d = self._single(target, caller, "wake_test")
         selfs = await self._self_names(self.repo.list())
         dev = replace(d, is_self=d.is_self or d.name in selfs)
+        if not dev.is_self:  # a self device is refused below without running anything
+            self._audit_attempt(caller, d.name, "wake_test", None, [d])
         try:
             res = await self._wake_test(self.actions, self.repo, self.audit, dev, caller=caller)
         except asyncio.CancelledError:
@@ -549,6 +577,7 @@ class Service:
                    "error": LOCKED}
             self._audit(caller, d.name, "run_command", f"fail: {LOCKED} | {shown}")
             return out
+        self._audit_attempt(caller, d.name, "run_command", None, [d], shown)
         try:
             async with (lock if lock is not None else contextlib.nullcontext()):
                 r = await self.runner.run(d, cmd, timeout=RUN_COMMAND_TIMEOUT)
@@ -572,7 +601,7 @@ class Service:
 
     async def acknowledge_host_key(self, name: str, caller: str = "ui") -> None:
         """Accept a changed host key: forget the pin; the next successful connect
-        re-pins it and clears host_key_ack (see HostKeyAckRunner)."""
+        re-pins it and clears host_key_ack (SshRunner on_repin -> host_key_ack_clearer)."""
         d = self.repo.get(name)
         if d is None:
             raise UnknownTarget(name)

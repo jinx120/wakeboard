@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import json
@@ -11,6 +12,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError
 from itsdangerous import BadSignature, TimestampSigner, URLSafeTimedSerializer
 
+MIN_PASSWORD = 8
 MAX_FAILURES = 5
 LOCKOUT_SECONDS = 15 * 60
 SESSION_MAX_AGE = 7 * 24 * 3600
@@ -30,6 +32,9 @@ class AuthStore:
         # Pass the app's shared DB write lock so kv writes never interleave with
         # other writers on the same connection; must not be held when calling in.
         self._lock = lock if lock is not None else threading.Lock()
+        # Serializes whole login checks (lockout counting) without holding the DB
+        # write lock during the slow argon2 verify.
+        self._login_lock = threading.Lock()
 
     # -- kv helpers
     def _get(self, key: str) -> str | None:
@@ -115,11 +120,14 @@ class AuthStore:
         client_ip must be the trusted TCP peer address, never a value derived
         from request headers (e.g. X-Forwarded-For), which a client can spoof
         to dodge the lockout. Raises LockedOut while locked, even for the
-        correct password. The whole check/verify/update is serialized.
+        correct password. The whole check/verify/update is serialized (login
+        lock); the DB write lock is held only around the writes, not the verify.
+        Blocking (argon2): from async code use check_password_async.
         """
-        with self._lock:
+        with self._login_lock:
             now = self.now()
-            self._prune(now)
+            with self._lock:
+                self._prune(now)
             key = self._lock_key(client_ip)
             state = self._lock_state(key)
             if state["locked_until"] > now:
@@ -133,15 +141,20 @@ class AuthStore:
                     ok = self._ph.verify(stored, pw)
                 except (VerificationError, InvalidHashError):
                     ok = False
-            if ok:
-                self._delete(key)
-                return True
-            state["fails"] += 1
-            state["last"] = now
-            if state["fails"] >= MAX_FAILURES:
-                state["locked_until"] = now + LOCKOUT_SECONDS
-            self._set(key, json.dumps(state))
+            with self._lock:
+                if ok:
+                    self._delete(key)
+                    return True
+                state["fails"] += 1
+                state["last"] = now
+                if state["fails"] >= MAX_FAILURES:
+                    state["locked_until"] = now + LOCKOUT_SECONDS
+                self._set(key, json.dumps(state))
             return False
+
+    async def check_password_async(self, pw: str, client_ip: str) -> bool:
+        """check_password in a worker thread, so argon2 never blocks the event loop."""
+        return await asyncio.to_thread(self.check_password, pw, client_ip)
 
     # -- sessions
     def _secret(self) -> str:

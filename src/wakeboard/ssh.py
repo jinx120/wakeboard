@@ -1,13 +1,17 @@
 """SSH command runner with trust-on-first-use host keys and password enrollment."""
 import asyncio
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import asyncssh
 
 from wakeboard.devices import Device
 from wakeboard.sshkeys import KeyStore
+
+log = logging.getLogger(__name__)
 
 
 class HostKeyChanged(Exception):
@@ -83,9 +87,15 @@ class _TofuClient(asyncssh.SSHClient):
 
 
 class SshRunner:
-    def __init__(self, keystore: KeyStore, known_hosts: Path):
+    def __init__(self, keystore: KeyStore, known_hosts: Path,
+                 on_repin: Callable[[Device], None] | None = None):
+        """``on_repin(device)`` is called whenever a key is pinned for a device whose
+        changed host key was acknowledged (host_key_ack), so the caller can persist
+        the cleared flag. It runs for every connection path (run, sudo_ok,
+        enroll_with_password), as soon as the connection is up."""
         self.keystore = keystore
         self.known_hosts = Path(known_hosts)
+        self.on_repin = on_repin
 
     # ---- known_hosts file ------------------------------------------------
 
@@ -155,6 +165,14 @@ class SshRunner:
             raise
         if client.seen_key is not None:
             self._pin(device, client.seen_key)
+            if device.host_key_ack:
+                # The acknowledged key is pinned now: a later change is refused again.
+                device.host_key_ack = False
+                if self.on_repin is not None:
+                    try:
+                        self.on_repin(device)
+                    except Exception:
+                        log.exception("clearing host_key_ack for %s failed", device.name)
         return conn, client
 
     def _key_auth(self, device: Device) -> dict:

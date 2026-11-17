@@ -11,12 +11,12 @@ from starlette.routing import Route
 from wakeboard.actions import Actions
 from wakeboard.api import build_api_router
 from wakeboard.audit import AuditLog
-from wakeboard.auth import AuthStore
+from wakeboard.auth import MIN_PASSWORD, AuthStore
 from wakeboard.config import Settings
 from wakeboard.db import connect
 from wakeboard.mcp_server import build_mcp
 from wakeboard.devices import DeviceRepo
-from wakeboard.service import HostKeyAckRunner, LockedAudit, LockedRepo, Service
+from wakeboard.service import LockedAudit, LockedRepo, Service, host_key_ack_clearer
 from wakeboard.ssh import SshRunner
 from wakeboard.sshkeys import KeyStore
 from wakeboard.status import Poller, Prober
@@ -53,13 +53,17 @@ def create_app(settings: Settings | None = None, *, prober=None, poller: Poller 
     auth = AuthStore(conn, lock=db_lock)
     pw = os.environ.get("WAKEBOARD_PASSWORD")
     if pw and not auth.password_set():
-        auth.set_password(pw)
+        if len(pw) < MIN_PASSWORD:
+            # Same rule as the setup page; the first-run setup page asks instead.
+            log.error("WAKEBOARD_PASSWORD ignored: it must be at least %d characters", MIN_PASSWORD)
+        else:
+            auth.set_password(pw)
 
     repo = LockedRepo(DeviceRepo(conn), db_lock)
     audit = LockedAudit(AuditLog(conn), db_lock)
     keystore = KeyStore(settings.data_dir)
     keystore.ensure_global()
-    runner = HostKeyAckRunner(SshRunner(keystore, settings.data_dir / "known_hosts"), repo)
+    runner = SshRunner(keystore, settings.data_dir / "known_hosts", on_repin=host_key_ack_clearer(repo))
     prober = prober or Prober()
     actions = Actions(runner, prober, settings, **(actions_kw or {}))  # the ONE shared instance (per-device locks)
     state: dict[str, bool] = {}

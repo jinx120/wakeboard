@@ -4,9 +4,9 @@ import pytest
 from wakeboard.actions import ActionResult, StageResult
 from wakeboard.audit import AuditLog
 from wakeboard.devices import Device, DeviceRepo
-from wakeboard.service import (MAX_OUTPUT, ConfirmationRequired, HostKeyAckRunner,
+from wakeboard.service import (MAX_OUTPUT, ConfirmationRequired,
                                InvalidRequest, RunCommandDisabled, SelfTargetRefused, Service,
-                               detect_self)
+                               detect_self, host_key_ack_clearer)
 from wakeboard.ssh import ConnectFailed, HostKeyChanged, RunResult, SudoRequired
 from wakeboard.status import Info
 from wakeboard.targets import NoDevices, UnknownTarget
@@ -274,8 +274,10 @@ async def test_every_action_audited_with_caller(svc, repo, audit, monkeypatch):
         await svc.reboot("all", caller="mcp")
     rows = list(reversed(audit.list()))
     assert [r["action"].split()[0] for r in rows] == [
-        "wake", "shutdown", "shutdown", "reboot", "reboot", "wake_check", "run_command", "reboot"]
+        "wake", "shutdown", "shutdown", "reboot", "reboot", "wake_check", "run_command",
+        "run_command", "reboot"]
     assert rows[1]["result"].startswith("attempt") and rows[3]["result"].startswith("attempt")
+    assert rows[6]["result"].startswith("attempt") and rows[7]["result"].startswith("ok")
     assert all(r["caller"] == "mcp" for r in rows)
     assert rows[0]["target"] == "pve1" and rows[0]["result"].startswith("ok")
     assert rows[-1]["target"] == "all" and "refused" in rows[-1]["result"]
@@ -374,22 +376,23 @@ async def test_list_devices_has_state_and_no_secrets(repo, audit, actions, runne
 
 # ---- host key acknowledge ------------------------------------------------------
 
-async def test_acknowledge_sets_flag_and_first_success_clears_it(repo, audit, actions, runner):
-    wrapped = HostKeyAckRunner(runner, repo)
-    svc = make_service(repo, audit, actions, wrapped)
+async def test_acknowledge_sets_flag(repo, audit, actions, runner):
+    svc = make_service(repo, audit, actions, runner)
     await svc.acknowledge_host_key("pve1", caller="ui")
     assert runner.acked == ["pve1"] and repo.get("pve1").host_key_ack is True
     assert audit.list()[0]["action"] == "acknowledge_host_key"
-    runner.exc = ConnectFailed("down")
-    with pytest.raises(ConnectFailed):
-        await wrapped.run(repo.get("pve1"), "true")
-    assert repo.get("pve1").host_key_ack is True  # failed connect keeps the ack
-    runner.exc = None
-    dev = repo.get("pve1")
-    await wrapped.run(dev, "true")
-    assert repo.get("pve1").host_key_ack is False and dev.host_key_ack is False
     with pytest.raises(UnknownTarget):
         await svc.acknowledge_host_key("nope", caller="ui")
+
+
+def test_host_key_ack_clearer_persists_cleared_flag(repo):
+    d = repo.get("pve1")
+    d.host_key_ack = True
+    repo.update(d)
+    clear = host_key_ack_clearer(repo)
+    clear(Device(name="pve1", host="x"))
+    assert repo.get("pve1").host_key_ack is False
+    clear(Device(name="gone", host="x"))  # unknown device: no-op
 
 
 # ---- wake_test --------------------------------------------------------------------
@@ -626,3 +629,93 @@ def test_redact_cmd_cases(cmd, secret, keep):
 ])
 def test_redact_cmd_leaves_harmless_commands(cmd):
     assert redact_cmd(cmd) == cmd
+
+
+# ---- audit-first for run_command and wake_test --------------------------------------
+
+async def test_run_command_attempt_audit_fails_closed(repo, audit, actions, runner):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    svc = make_service(repo, BrokenAudit(audit), actions, runner)
+    with pytest.raises(AuditUnavailable):
+        await svc.run_command("pve1", "uptime", caller="api")
+    assert runner.calls == []
+
+
+async def test_run_command_writes_attempt_row_first(repo, audit, actions, runner):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    svc = make_service(repo, audit, actions, runner)
+    await svc.run_command("pve1", "echo password=hunter2", caller="api")
+    rows = [r for r in audit.list() if r["action"] == "run_command"]
+    results = [r["result"] for r in rows]
+    assert any(x.startswith("attempt: targets=pve1 | ") for x in results), results
+    assert all("hunter2" not in x for x in results)
+
+
+async def test_wake_test_attempt_audit_fails_closed(repo, audit, actions, runner):
+    svc = make_service(repo, BrokenAudit(audit), actions, runner)
+    with pytest.raises(AuditUnavailable):
+        await svc.wake_test("pve1", caller="ui")
+    assert actions.calls == []
+
+
+# ---- self detection: every local interface address ------------------------------------
+
+from wakeboard.service import default_local_ips, interface_ips
+
+FIB_TRIE = """Main:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 0.0.0.0
+        /0 universe UNICAST
+     +-- 100.64.0.0/10 2 0 2
+        |-- 100.101.102.103
+           /32 host LOCAL
+        |-- 100.90.1.1
+           /32 universe UNICAST
+     +-- 172.17.0.0/16 2 0 2
+        |-- 172.17.0.0
+           /32 link BROADCAST
+        |-- 172.17.0.1
+           /32 host LOCAL
+     |-- 192.168.1.50
+        /32 host LOCAL
+Local:
+  +-- 0.0.0.0/0 3 0 5
+     |-- 192.168.1.50
+        /32 host LOCAL
+"""
+IF_INET6 = """fd7a115ca1e0000000000000b93a370d 03 80 00 80 tailscale0
+fe800000000000002fa4cd3f3e0ae9ec 03 40 20 80 tailscale0
+00000000000000000000000000000001 01 80 10 80       lo
+"""
+
+
+def test_interface_ips_parses_proc_files(tmp_path):
+    (tmp_path / "fib_trie").write_text(FIB_TRIE)
+    (tmp_path / "if_inet6").write_text(IF_INET6)
+    got = interface_ips(tmp_path / "fib_trie", tmp_path / "if_inet6")
+    assert got == {"100.101.102.103", "172.17.0.1", "192.168.1.50",
+                   "fd7a:115c:a1e0::b93a:370d", "fe80::2fa4:cd3f:3e0a:e9ec", "::1"}
+    # peers routed via tailscale (UNICAST) and broadcast entries are not local
+    assert "100.90.1.1" not in got and "172.17.0.0" not in got
+
+
+def test_interface_ips_missing_files_is_empty(tmp_path):
+    assert interface_ips(tmp_path / "nope", tmp_path / "nope6") == set()
+
+
+def test_default_local_ips_includes_interfaces(monkeypatch):
+    import wakeboard.service as s
+    monkeypatch.setattr(s, "interface_ips", lambda *a, **k: {"100.101.102.103", "172.17.0.1"})
+    got = default_local_ips()
+    assert {"100.101.102.103", "172.17.0.1", "127.0.0.1", "::1"} <= got
+
+
+def test_detect_self_matches_tailscale_and_docker_bridge_addresses():
+    devs = [Device(name="ts", host="100.101.102.103"), Device(name="br", host="172.17.0.1"),
+            Device(name="v6", host="fd7a:115c:a1e0::b93a:370d"), Device(name="other", host="10.0.0.9")]
+    local = {"192.168.1.50", "100.101.102.103", "172.17.0.1", "fd7a:115c:a1e0::b93a:370d"}
+    assert detect_self(devs, local_ips=lambda: local, resolve=lambda h: set()) == {"ts", "br", "v6"}

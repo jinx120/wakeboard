@@ -283,3 +283,86 @@ async def test_run_auth_rejected_raises_auth_failed(runner, device, ssh_server):
     with pytest.raises(AuthFailed):
         await runner.run(device, "true")
     assert ssh_server.commands == []
+
+
+# ---- host_key_ack is cleared whenever a key is (re)pinned -----------------------
+
+def _ack_runner(keystore, known_hosts):
+    cleared = []
+    return SshRunner(keystore, known_hosts, on_repin=lambda d: cleared.append(d.name)), cleared
+
+
+async def _pin_then_swap_and_ack(r, device, authorized):
+    authorized.responses["true"] = Canned()
+    await r.run(device, "true")
+    authorized.swap_host_key()
+    r.acknowledge_host_key(device)
+    device.host_key_ack = True
+
+
+async def test_repin_via_run_clears_ack_and_next_change_is_hard_error(
+        keystore, known_hosts, device, authorized):
+    r, cleared = _ack_runner(keystore, known_hosts)
+    await _pin_then_swap_and_ack(r, device, authorized)
+    await r.run(device, "true")
+    assert device.host_key_ack is False and cleared == ["box"]
+    authorized.swap_host_key()
+    with pytest.raises(HostKeyChanged):
+        await r.run(device, "true")
+
+
+async def test_repin_clears_ack_even_when_command_then_fails(keystore, known_hosts, device, authorized):
+    r, cleared = _ack_runner(keystore, known_hosts)
+    await _pin_then_swap_and_ack(r, device, authorized)
+    authorized.responses["slow"] = Canned(delay=5)
+    with pytest.raises(asyncio.TimeoutError):
+        await r.run(device, "slow", timeout=1.0)
+    assert device.host_key_ack is False and cleared == ["box"]
+
+
+async def test_repin_via_sudo_ok_clears_ack(keystore, known_hosts, ssh_server):
+    ssh_server.authorized_keys.add(keystore.public_key())
+    dev = Device(name="u", host=ssh_server.host, ssh_port=ssh_server.port, ssh_user="alice")
+    ssh_server.responses["sudo -n true"] = Canned("", "", 0)
+    r, cleared = _ack_runner(keystore, known_hosts)
+    await r.run(dev, "sudo -n true")
+    ssh_server.swap_host_key()
+    r.acknowledge_host_key(dev)
+    dev.host_key_ack = True
+    assert await r.sudo_ok(dev) is True
+    assert dev.host_key_ack is False and cleared == ["u"]
+
+
+async def test_repin_via_enroll_clears_ack_and_next_change_is_hard_error(
+        keystore, known_hosts, device, ssh_server):
+    ssh_server.shell_allowlist.add(keystore.authorize_command())
+    ssh_server.password = PASSWORD
+    r, cleared = _ack_runner(keystore, known_hosts)
+    await r.enroll_with_password(device, PASSWORD)
+    assert cleared == []  # first use with no ack: nothing to clear
+    ssh_server.swap_host_key()
+    r.acknowledge_host_key(device)
+    device.host_key_ack = True
+    await r.enroll_with_password(device, PASSWORD)
+    assert device.host_key_ack is False and cleared == ["box"]
+    ssh_server.swap_host_key()
+    with pytest.raises(HostKeyChanged):
+        await r.enroll_with_password(device, PASSWORD)
+
+
+async def test_failed_connect_keeps_ack(keystore, known_hosts, device, ssh_server):
+    # key auth rejected: no connection, no pin, ack kept for the next attempt
+    r, cleared = _ack_runner(keystore, known_hosts)
+    device.host_key_ack = True
+    with pytest.raises(AuthFailed):
+        await r.run(device, "true")
+    assert device.host_key_ack is True and cleared == []
+
+
+async def test_on_repin_error_does_not_break_connection(keystore, known_hosts, device, authorized):
+    def boom(d):
+        raise RuntimeError("db down")
+    r = SshRunner(keystore, known_hosts, on_repin=boom)
+    await _pin_then_swap_and_ack(r, device, authorized)
+    assert (await r.run(device, "true")).exit == 0
+    assert device.host_key_ack is False

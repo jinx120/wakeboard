@@ -36,6 +36,9 @@
     <label class="check"><input type="checkbox" name="allow_run_command" value="1"{% if form.allow_run_command == "1" %} checked{% endif %}> Allow run_command (MCP/API)</label>
     <label class="check"><input type="checkbox" name="bios_verified" value="1"{% if form.bios_verified == "1" %} checked{% endif %}> Wake-on-LAN enabled in BIOS</label>
     <label class="check"><input type="checkbox" name="is_self" value="1"{% if form.is_self == "1" %} checked{% endif %}> This machine runs or hosts Wakeboard</label>
+    <p class="hint">Wakeboard detects the machine it runs on by its interface addresses. If Wakeboard
+      runs in a VM or container on another host (a Proxmox node, say), that hypervisor is not detected:
+      tick this box for it so group and "all" actions never power it off.</p>
     <button type="submit" class="primary">{{ "Save" if editing else "Add device" }}</button>
     <a class="btn" href="{{ '/devices/' ~ device.name|q if editing else '/' }}">Cancel</a>
   </form>

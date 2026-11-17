@@ -176,3 +176,46 @@ def test_revoke_session_is_server_side(conn, store, clock):
     store.revoke_session(store.new_session())
     rows = conn.execute("SELECT key FROM kv WHERE key LIKE 'auth.revoked.%'").fetchall()
     assert len(rows) == 1
+
+
+async def test_check_password_async_runs_off_loop_and_keeps_lockout(store):
+    import asyncio
+    import threading
+    loop_thread = threading.get_ident()
+    seen = []
+    real = store._ph
+
+    class Spy:
+        def verify(self, *a):
+            seen.append(threading.get_ident())
+            return real.verify(*a)
+    store._ph = Spy()
+    assert await store.check_password_async("hunter2", "1.2.3.4") is True
+    assert seen and seen[0] != loop_thread
+    results = await asyncio.gather(*(store.check_password_async("bad", "6.6.6.7") for _ in range(8)),
+                                   return_exceptions=True)
+    assert results.count(False) == 5
+    assert sum(isinstance(r, LockedOut) for r in results) == 3
+
+
+def test_db_lock_not_held_during_verify(conn, clock):
+    import threading
+    db_lock = threading.RLock()
+    s = AuthStore(conn, now=clock, lock=db_lock)
+    s.set_password("hunter2")
+    held = []
+    real = s._ph
+
+    def spy(*a):
+        # another thread must be able to take the DB write lock while argon2 runs
+        got = []
+        t = threading.Thread(target=lambda: got.append(db_lock.acquire(timeout=1)) or db_lock.release())
+        t.start(); t.join()
+        held.append(got == [True])
+        return real.verify(*a)
+
+    class Spy:
+        verify = staticmethod(spy)
+    s._ph = Spy()
+    assert s.check_password("hunter2", "1.1.1.9") is True
+    assert held == [True]
