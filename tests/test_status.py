@@ -133,3 +133,78 @@ async def test_poller_updates_state_for_all_devices(conn):
         await Poller(sleep=sleep).run(repo, ByName({"a"}, boom={"c"}), state, 7)
     assert state == {"a": True, "b": False, "c": False}
     assert calls == [7]
+
+
+REAL = '''uptime=64759.48
+load1=0.72
+mem=25.2
+disk=66
+temp=
+pve=
+vms=0
+cts=0
+kernel=6.8.0-149-generic
+'''
+
+
+def test_parse_real_command_output():
+    i = parse_info(REAL, True)
+    assert i.kernel and i.uptime_s > 0 and i.vms_running == 0
+
+
+async def test_poller_probes_concurrently(conn):
+    import time
+    from wakeboard.devices import DeviceRepo
+    repo = DeviceRepo(conn)
+    for n in range(8):
+        repo.add(Device(name=f"d{n}", host="h"))
+
+    class Slow:
+        async def is_up(self, d):
+            await asyncio.sleep(0.2)
+            return True
+
+    async def stop(s):
+        raise asyncio.CancelledError
+
+    state = {}
+    t = time.monotonic()
+    with pytest.raises(asyncio.CancelledError):
+        await Poller(sleep=stop).run(repo, Slow(), state, 1)
+    assert time.monotonic() - t < 0.8
+    assert len(state) == 8 and all(state.values())
+
+
+async def test_poller_cuts_off_hung_probe(conn):
+    from wakeboard.devices import DeviceRepo
+    repo = DeviceRepo(conn)
+    repo.add(Device(name="hang", host="h"))
+    repo.add(Device(name="ok", host="h"))
+
+    class P:
+        async def is_up(self, d):
+            if d.name == "hang":
+                await asyncio.Event().wait()
+            return True
+
+    async def stop(s):
+        raise asyncio.CancelledError
+
+    state = {}
+    with pytest.raises(asyncio.CancelledError):
+        await Poller(sleep=stop, probe_timeout=0.1).run(repo, P(), state, 1)
+    assert state == {"hang": False, "ok": True}
+
+
+async def test_dash_host_never_reaches_subprocess(monkeypatch):
+    called = []
+
+    async def fake(*a, **k):
+        called.append(a)
+        raise AssertionError
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake)
+    for h in ("-f", ""):
+        d = Device(name="x", host=h)
+        assert not await Prober(tcp=_false).is_up(d)
+    assert called == []

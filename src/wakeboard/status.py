@@ -43,18 +43,27 @@ async def _tcp(device: Device) -> bool:
     return True
 
 
+def _safe_host(host: str) -> bool:
+    return bool(host) and not host.startswith("-")
+
+
 async def _ping(device: Device) -> bool:
+    if not _safe_host(device.host):
+        return False
     try:
         proc = await asyncio.create_subprocess_exec(
-            "ping", "-c1", "-W2", device.host,
+            "ping", "-c1", "-W2", "--", device.host,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     except (FileNotFoundError, PermissionError, OSError):
         return False
     try:
         return await asyncio.wait_for(proc.wait(), 5) == 0
     except asyncio.TimeoutError:
-        proc.kill()
         return False
+    finally:
+        if proc.returncode is None:
+            proc.kill()
+            await asyncio.shield(proc.wait())
 
 
 class Prober:
@@ -68,6 +77,8 @@ class Prober:
             return False
 
     async def is_up(self, device: Device) -> bool:
+        if not _safe_host(device.host):
+            return False
         if await self._safe(self.tcp, device):
             return True
         return await self._safe(self.ping, device)
@@ -152,10 +163,23 @@ class InfoCache:
 # ---- poller --------------------------------------------------------------------
 
 class Poller:
-    def __init__(self, sleep=asyncio.sleep):
+    def __init__(self, sleep=asyncio.sleep, probe_timeout: float = 10, concurrency: int = 8):
         self.sleep = sleep
+        self.probe_timeout = probe_timeout
+        self.concurrency = concurrency
+
+    async def _probe(self, sem, prober, d: Device) -> bool:
+        async with sem:
+            try:
+                return bool(await asyncio.wait_for(prober.is_up(d), self.probe_timeout))
+            except asyncio.TimeoutError:
+                log.warning("poller: probe of %s timed out", d.name)
+            except Exception:
+                log.exception("poller: probe of %s failed", d.name)
+            return False
 
     async def run(self, repo, prober, state: dict[str, bool], interval: float) -> None:
+        sem = asyncio.Semaphore(self.concurrency)
         while True:
             try:
                 devices = repo.list()
@@ -163,13 +187,8 @@ class Poller:
                 log.exception("poller: listing devices failed")
                 devices = None
             if devices is not None:
-                for d in devices:
-                    try:
-                        state[d.name] = bool(await prober.is_up(d))
-                    except Exception:
-                        log.exception("poller: probe of %s failed", d.name)
-                        state[d.name] = False
-                names = {d.name for d in devices}
-                for k in [k for k in state if k not in names]:
-                    del state[k]
+                results = await asyncio.gather(*(self._probe(sem, prober, d) for d in devices))
+                new = {d.name: r for d, r in zip(devices, results)}
+                state.clear()
+                state.update(new)
             await self.sleep(interval)
