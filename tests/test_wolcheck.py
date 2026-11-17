@@ -313,3 +313,36 @@ async def test_wake_test_refuses_self(conn):
     assert res.stages == [StageResult("precheck", False,
                                       "refusing to wake-test the host Wakeboard runs on")]
     assert repo.get("box").wake_test_result is None
+
+
+class BrokenRepo:
+    def __init__(self, repo):
+        self.repo = repo
+
+    def get(self, name):
+        return self.repo.get(name)
+
+    def update(self, d):
+        raise RuntimeError("db locked")
+
+
+async def test_wake_test_bookkeeping_failure_keeps_original_exception(conn):
+    repo, audit, d = await _seed(conn)
+    with pytest.raises(ConnectFailed, match="no route"):
+        await wake_test(RaisingActions("shutdown", ConnectFailed("no route")),
+                        BrokenRepo(repo), audit, d)
+
+
+async def test_wake_test_bookkeeping_failure_keeps_cancellation(conn):
+    import asyncio
+    repo, audit, d = await _seed(conn)
+    with pytest.raises(asyncio.CancelledError):
+        await wake_test(RaisingActions("wake", asyncio.CancelledError()),
+                        BrokenRepo(repo), audit, d)
+
+
+async def test_wol_check_persistence_nic_whole_word_only():
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
+                    "grep": ok("/etc/network/interfaces:post-up ethtool -s eno10 wol g")})
+    rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
+    assert rep.persistent is False

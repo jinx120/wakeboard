@@ -4,6 +4,7 @@ NIC names come from remote output, so they are validated before they reach a
 command line and quoted with shlex.quote.
 """
 import asyncio
+import logging
 import re
 import shlex
 import time
@@ -14,6 +15,7 @@ from wakeboard.devices import Device
 from wakeboard.ssh import RunResult
 from wakeboard.wol import normalize_mac
 
+log = logging.getLogger(__name__)
 _NIC_OK = re.compile(r"^[A-Za-z0-9_.:-]{1,15}$")
 _LINK_LINE = re.compile(r"^\d+:\s+([^:\s]+?)(?:@\S+)?:\s.*?link/ether\s+([0-9a-fA-F:]{17})\b")
 _PERSIST_PATHS = ("/etc/systemd/network /etc/network/interfaces /etc/network/interfaces.d "
@@ -142,7 +144,8 @@ def _persists(grep_out: str, ident: list[str]) -> bool:
     """True if some single file mentions both wol/wake-on and this NIC or MAC."""
     wol: set[str] = set()
     nic: set[str] = set()
-    ident_re = re.compile("|".join(ident), re.I)
+    edge = r"(?<![A-Za-z0-9_.:-])(?:%s)(?![A-Za-z0-9_.:-])"
+    ident_re = re.compile(edge % "|".join(ident), re.I)
     for line in grep_out.splitlines():
         path, _, text = line.partition(":")
         if re.search(r"wol|wake-on|wakeonlan", text, re.I):
@@ -159,6 +162,14 @@ def adopt_mac(repo, device: Device, report: WolReport) -> bool:
     device.mac = normalize_mac(report.mac)
     repo.update(device)
     return True
+
+
+def _safely(fn, *args) -> None:
+    """Run a bookkeeping step in an error handler; never let it mask the real exception."""
+    try:
+        fn(*args)
+    except Exception:
+        log.exception("wake_test bookkeeping failed while handling another error")
 
 
 _NOT_RUN = ("lock", "precheck")
@@ -216,8 +227,8 @@ async def wake_test(actions, repo, audit, device: Device, caller: str = "ui",
         return ActionResult(ok=up.ok, stages=stages)
     except asyncio.CancelledError:
         if shut_down:
-            stamp("error: cancelled")
+            _safely(stamp, "error: cancelled")
         raise
     except Exception as e:
-        stamp(f"error: {e or type(e).__name__}")
+        _safely(stamp, f"error: {e or type(e).__name__}")
         raise
