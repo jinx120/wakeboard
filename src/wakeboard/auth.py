@@ -4,6 +4,7 @@ import json
 import math
 import secrets
 import sqlite3
+import threading
 import time
 
 from argon2 import PasswordHasher
@@ -26,6 +27,7 @@ class AuthStore:
         self.conn = conn
         self.now = now
         self._ph = PasswordHasher()
+        self._lock = threading.Lock()
 
     # -- kv helpers
     def _get(self, key: str) -> str | None:
@@ -49,40 +51,79 @@ class AuthStore:
         return self._get("auth.password_hash") is not None
 
     def set_password(self, pw: str) -> None:
-        self._set("auth.password_hash", self._ph.hash(pw))
+        with self._lock:
+            self._set("auth.password_hash", self._ph.hash(pw))
+            # rotate the session secret: all existing sessions become invalid
+            self._set("auth.session_secret", secrets.token_hex(32))
 
-    def _lock_state(self, ip: str) -> dict:
-        raw = self._get(f"auth.lock.{ip}")
+    @staticmethod
+    def _lock_key(ip: str) -> str:
+        # fixed-length key regardless of input length
+        return "auth.lock." + hashlib.sha256(str(ip).encode()).hexdigest()[:32]
+
+    def _lock_state(self, key: str) -> dict:
+        raw = self._get(key)
         if raw:
             try:
                 return json.loads(raw)
             except ValueError:
                 pass
-        return {"fails": 0, "locked_until": 0}
+        return {"fails": 0, "locked_until": 0, "last": 0}
+
+    def _prune(self, now: float) -> None:
+        """Delete lock rows whose lock expired and with no recent failures."""
+        rows = self.conn.execute(
+            "SELECT key, value FROM kv WHERE key LIKE 'auth.lock.%'"
+        ).fetchall()
+        stale = []
+        for r in rows:
+            try:
+                st = json.loads(r["value"])
+                dead = (
+                    st.get("locked_until", 0) <= now
+                    and now - st.get("last", 0) > LOCKOUT_SECONDS
+                )
+            except (ValueError, AttributeError, TypeError):
+                dead = True
+            if dead:
+                stale.append((r["key"],))
+        if stale:
+            self.conn.executemany("DELETE FROM kv WHERE key=?", stale)
+            self.conn.commit()
 
     def check_password(self, pw: str, client_ip: str) -> bool:
-        now = self.now()
-        state = self._lock_state(client_ip)
-        if state["locked_until"] > now:
-            raise LockedOut(math.ceil(state["locked_until"] - now))
-        if state["locked_until"]:  # lockout elapsed: start fresh
-            state = {"fails": 0, "locked_until": 0}
-        stored = self._get("auth.password_hash")
-        ok = False
-        if stored:
-            try:
-                ok = self._ph.verify(stored, pw)
-            except (VerificationError, InvalidHashError):
-                ok = False
-        key = f"auth.lock.{client_ip}"
-        if ok:
-            self._delete(key)
-            return True
-        state["fails"] += 1
-        if state["fails"] >= MAX_FAILURES:
-            state["locked_until"] = now + LOCKOUT_SECONDS
-        self._set(key, json.dumps(state))
-        return False
+        """Check the password, enforcing per-IP lockout.
+
+        client_ip must be the trusted TCP peer address, never a value derived
+        from request headers (e.g. X-Forwarded-For), which a client can spoof
+        to dodge the lockout. Raises LockedOut while locked, even for the
+        correct password. The whole check/verify/update is serialized.
+        """
+        with self._lock:
+            now = self.now()
+            self._prune(now)
+            key = self._lock_key(client_ip)
+            state = self._lock_state(key)
+            if state["locked_until"] > now:
+                raise LockedOut(math.ceil(state["locked_until"] - now))
+            if state["locked_until"]:  # lockout elapsed: start fresh
+                state = {"fails": 0, "locked_until": 0, "last": 0}
+            stored = self._get("auth.password_hash")
+            ok = False
+            if stored:
+                try:
+                    ok = self._ph.verify(stored, pw)
+                except (VerificationError, InvalidHashError):
+                    ok = False
+            if ok:
+                self._delete(key)
+                return True
+            state["fails"] += 1
+            state["last"] = now
+            if state["fails"] >= MAX_FAILURES:
+                state["locked_until"] = now + LOCKOUT_SECONDS
+            self._set(key, json.dumps(state))
+            return False
 
     # -- sessions
     def _secret(self) -> str:

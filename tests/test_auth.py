@@ -107,3 +107,56 @@ def test_check_token_none_false(store):
     store.rotate_token()
     assert store.check_token(None) is False
     assert store.check_token("") is False
+
+
+def test_fifth_failure_locks_sixth_raises_with_correct_password(store):
+    for _ in range(4):
+        assert store.check_password("bad", "5.5.5.5") is False
+    assert store.check_password("bad", "5.5.5.5") is False  # 5th triggers lock
+    with pytest.raises(LockedOut):
+        store.check_password("hunter2", "5.5.5.5")
+
+
+def test_concurrent_wrong_guesses_cannot_bypass_lockout(store):
+    import threading
+
+    results = []
+
+    def guess():
+        try:
+            results.append(store.check_password("bad", "6.6.6.6"))
+        except LockedOut:
+            results.append("locked")
+
+    threads = [threading.Thread(target=guess) for _ in range(8)]
+    [t.start() for t in threads]
+    [t.join() for t in threads]
+    assert results.count(False) == 5
+    assert results.count("locked") == 3
+    with pytest.raises(LockedOut):
+        store.check_password("hunter2", "6.6.6.6")
+
+
+def test_lock_key_length_bounded(conn, store):
+    store.check_password("bad", "x" * 10000)
+    keys = [r["key"] for r in conn.execute("SELECT key FROM kv WHERE key LIKE 'auth.lock.%'")]
+    assert len(keys) == 1 and len(keys[0]) < 64
+
+
+def test_stale_lock_rows_pruned(conn, store, clock):
+    store.check_password("bad", "7.7.7.7")
+    for _ in range(5):
+        store.check_password("bad", "8.8.8.8")
+    n = lambda: conn.execute("SELECT count(*) FROM kv WHERE key LIKE 'auth.lock.%'").fetchone()[0]
+    assert n() == 2
+    clock.t += 2000
+    store.check_password("hunter2", "9.9.9.9")
+    assert n() == 0
+
+
+def test_set_password_invalidates_sessions(store):
+    c = store.new_session()
+    assert store.valid_session(c)
+    store.set_password("newpass")
+    assert store.valid_session(c) is False
+    assert store.valid_session(store.new_session()) is True
