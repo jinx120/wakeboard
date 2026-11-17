@@ -144,7 +144,7 @@ def _persists(grep_out: str, ident: list[str]) -> bool:
     """True if some single file mentions both wol/wake-on and this NIC or MAC."""
     wol: set[str] = set()
     nic: set[str] = set()
-    edge = r"(?<![A-Za-z0-9_.:])(?:%s)(?![A-Za-z0-9_.:])"
+    edge = r"(?<![A-Za-z0-9_.:])(?:%s)(?![A-Za-z0-9_:])"
     ident_re = re.compile(edge % "|".join(ident), re.I)
     for line in grep_out.splitlines():
         path, _, text = line.partition(":")
