@@ -51,3 +51,10 @@ def test_is_bulk(repo):
     assert is_bulk("all", repo)
     assert not is_bulk("a", repo)
     assert not is_bulk("lab", repo)  # device name wins
+
+
+def test_single_member_group_is_bulk(conn):
+    r = DeviceRepo(conn)
+    r.add(Device(name="a", host="1", groups=["solo"]))
+    assert is_bulk("solo", r)
+    assert is_bulk("SOLO", r)

@@ -25,6 +25,7 @@ class Device:
     notes: str = ""
     bios_verified: bool = False
     is_self: bool = False
+    host_key_ack: bool = False
     id: str | None = None
 
     def __post_init__(self):
@@ -35,13 +36,13 @@ class Device:
 
 
 _COLS = ["name", "host", "ssh_user", "ssh_port", "mac", "broadcast", "type", "groups",
-         "key_id", "allow_run_command", "shutdown_mode", "notes", "bios_verified", "is_self"]
+         "key_id", "allow_run_command", "shutdown_mode", "notes", "bios_verified", "is_self", "host_key_ack"]
 
 
 def _values(d: Device) -> list:
     return [d.name, d.host, d.ssh_user, d.ssh_port, d.mac, d.broadcast, d.type,
             ",".join(d.groups), d.key_id, int(d.allow_run_command), d.shutdown_mode,
-            d.notes, int(d.bios_verified), int(d.is_self)]
+            d.notes, int(d.bios_verified), int(d.is_self), int(d.host_key_ack)]
 
 
 def _row(r: sqlite3.Row) -> Device:
@@ -51,7 +52,7 @@ def _row(r: sqlite3.Row) -> Device:
         groups=[g for g in r["groups"].split(",") if g], key_id=r["key_id"],
         allow_run_command=bool(r["allow_run_command"]), shutdown_mode=r["shutdown_mode"],
         notes=r["notes"], bios_verified=bool(r["bios_verified"]),
-        is_self=bool(r["is_self"]), id=r["id"],
+        is_self=bool(r["is_self"]), host_key_ack=bool(r["host_key_ack"]), id=r["id"],
     )
 
 

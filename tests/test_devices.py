@@ -49,3 +49,14 @@ def test_connect_thread_safe(conn):
     t = threading.Thread(target=lambda: out.append(conn.execute("select 1").fetchone()[0]))
     t.start(); t.join()
     assert out == [1]
+
+
+def test_host_key_ack_roundtrip(conn):
+    repo = DeviceRepo(conn)
+    d = repo.add(Device(name="a", host="h"))
+    assert repo.get("a").host_key_ack is False
+    d.host_key_ack = True
+    repo.update(d)
+    assert repo.get("a").host_key_ack is True
+    assert repo.add(Device(name="b", host="h", host_key_ack=True)).host_key_ack is True
+    assert repo.get("b").host_key_ack is True

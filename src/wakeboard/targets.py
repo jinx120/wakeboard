@@ -34,4 +34,4 @@ def is_bulk(target: str, repo: DeviceRepo) -> bool:
         return False
     if target.lower() == "all":
         return True
-    return len(_group_members(repo, target)) > 1
+    return len(_group_members(repo, target)) > 0
