@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, StrictBool
 
 from wakeboard.devices import VALID_SHUTDOWN_MODES
-from wakeboard.service import (ConfirmationRequired, InvalidRequest, RunCommandDisabled,
+from wakeboard.service import (AuditUnavailable, ConfirmationRequired, InvalidRequest, RunCommandDisabled,
                                Service)
 from wakeboard.targets import NoDevices, UnknownTarget
 
@@ -51,6 +51,8 @@ async def _call(coro):
         raise HTTPException(status_code=403, detail=str(e)) from None
     except InvalidRequest as e:
         raise HTTPException(status_code=422, detail=str(e)) from None
+    except AuditUnavailable as e:
+        raise HTTPException(status_code=503, detail=str(e)) from None
 
 
 def build_api_router(service: Service, auth) -> APIRouter:

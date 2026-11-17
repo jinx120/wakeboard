@@ -203,3 +203,16 @@ def test_create_app_shares_db_lock_with_auth(tmp_path):
     from wakeboard import main
     app = main.create_app(Settings(data_dir=tmp_path))
     assert app.state.auth._lock is app.state.service.lock is app.state.repo.lock
+
+
+def test_api_audit_unavailable_returns_503(env):
+    c, t = env["client"], env["token"]
+
+    def boom(*a):
+        raise RuntimeError("database is locked")
+    env["audit"].record = boom  # the Service wraps this AuditLog instance
+    r = c.post("/api/v1/shutdown", json={"target": "pve1"}, headers=H(t))
+    assert r.status_code == 503 and "audit" in r.json()["detail"].lower()
+    r = c.post("/api/v1/reboot", json={"target": "pve1"}, headers=H(t))
+    assert r.status_code == 503
+    assert env["actions"].calls == []

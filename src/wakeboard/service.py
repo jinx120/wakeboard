@@ -54,6 +54,10 @@ class InvalidRequest(ValueError):
     pass
 
 
+class AuditUnavailable(Exception):
+    """The pre-action audit row could not be written; nothing destructive was run."""
+
+
 # ---- sqlite write serialization ------------------------------------------------
 
 class LockedRepo:
@@ -182,19 +186,45 @@ def _log_failure(what: str, name: str, e: BaseException) -> None:
         log.error("%s on %s failed unexpectedly", what, name, exc_info=e)
 
 
+_Q = r"""(?:'[^']*'|"[^"]*"|[^\s'"]+)"""          # a quoted string or a bare word
+_KEYS = r"(?:password|passwd|pwd|token|secret|api[_-]?key)"
+_PW_TOOLS = re.compile(r"(?<![\w-])(?:sshpass|mysql|mysqladmin|mysqldump|psql)(?![\w-])")
+_CURL = re.compile(r"(?<![\w-])curl(?![\w-])")
+
+# Always applied, in order (quoted values before bare words, inside each regex).
 _REDACT = [
-    (re.compile(r"(?i)(authorization:\s*)((?:bearer|basic|token)\s+)?\S+"), r"\1\2***"),
-    (re.compile(r"(?i)(--?(?:password|passwd|token|secret|api[_-]?key)\s+)(?!-)\S+"), r"\1***"),
-    (re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)(\s*[=:]\s*)\S+"), r"\1\2***"),
-    (re.compile(r"(?<!\S)-p(?=\S)[^\s'\"]+"), "-p***"),
+    (re.compile(r"(?i)(authorization:\s*)((?:bearer|basic|token)\s+)?" + _Q), r"\1\2***"),
+    (re.compile(r"(?i)\b(bearer\s+)(?!\*\*\*)[^\s'\"]+"), r"\1***"),
+    (re.compile(r"(?i)((?<!\S)--?" + _KEYS + r"\s+)(?!-)" + _Q), r"\1***"),
+    (re.compile(r"(?i)\b(" + _KEYS + r")(\s*[=:]\s*)" + _Q), r"\1\2***"),
+    (re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s@/]+@"), r"\1***@"),
+    (re.compile(r"""(?<!\S)-p(?:'[^']*'|"[^"]*")"""), "-p***"),       # -p'secret' anywhere
+]
+# Only when a password-taking tool is in the command: -psecret and -p secret.
+_REDACT_PW_TOOL = [
+    (re.compile(r"(?<!\S)-p(?=[^\s*])" + _Q), "-p***"),
+    (re.compile(r"(?<!\S)(-p\s+)(?!-)" + _Q), r"\1***"),
+]
+# Only for curl: -u/--user user:pass keeps the user.
+_REDACT_CURL = [
+    (re.compile(r"""(?<!\S)(-u|--user)(\s+|=)(['"])([^:'"]*):[^'"]*\3"""), r"\1\2\3\4:***\3"),
+    (re.compile(r"""(?<!\S)(-u|--user)(\s+|=)([^\s:'"]*):[^\s'"]+"""), r"\1\2\3:***"),
 ]
 
 
 def redact_cmd(cmd: str) -> str:
     """Audit form of a command: obvious secrets masked, cut to 120 chars plus
-    '…(+N chars, sha256:<8 hex>)' (hash of the redacted text, so it leaks nothing)."""
+    '…(+N chars, sha256:<8 hex>)' (hash of the redacted text, so it leaks nothing).
+
+    Redaction is best-effort: audit text masks common secret patterns only; do not
+    rely on it for commands that carry credentials."""
     out = cmd or ""
-    for rx, sub in _REDACT:
+    rules = list(_REDACT)
+    if _PW_TOOLS.search(out):
+        rules += _REDACT_PW_TOOL
+    if _CURL.search(out):
+        rules += _REDACT_CURL
+    for rx, sub in rules:
         out = rx.sub(sub, out)
     if len(out) > _AUDIT_CMD:
         digest = hashlib.sha256(out.encode()).hexdigest()[:8]
@@ -288,8 +318,15 @@ class Service:
     def _audit_attempt(self, caller, target, action, confirm, devices) -> None:
         # Written BEFORE the action: if it takes Wakeboard's own host down, the
         # intent is still on record even though no result row will follow.
-        self._audit(caller, target, action,
-                    f"attempt: confirm={confirm} targets={','.join(d.name for d in devices)}")
+        # Fails CLOSED: no record, no action.
+        names = ",".join(d.name for d in devices)
+        try:
+            self.audit.record(caller, str(target)[:200], action,
+                              f"attempt: confirm={confirm} targets={names}"[:_AUDIT_MAX])
+        except Exception as e:
+            log.error("pre-action audit write failed; refusing %s of %s: %s", action, target, _err(e))
+            raise AuditUnavailable(
+                f"audit log unavailable; refusing to {action} '{target}' without a record") from e
 
     def _resolve_target(self, target: str, caller: str, action: str) -> list[Device]:
         try:

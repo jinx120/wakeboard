@@ -555,3 +555,74 @@ async def test_run_command_takes_the_actions_device_lock(repo, audit, runner, tm
     assert res["ok"] is False and "in progress" in res["error"] and runner.calls == []
     res = await svc.run_command("pve1", "uptime", caller="api")
     assert res["ok"] is True and not lock.locked()
+
+
+# ---- re-review: fail-closed attempt row, harder redaction ----------------------------
+
+from wakeboard.service import AuditUnavailable
+
+
+class BrokenAudit:
+    def __init__(self, inner):
+        self.inner = inner
+
+    def record(self, *a):
+        raise RuntimeError("database is locked")
+
+    def __getattr__(self, n):
+        return getattr(self.inner, n)
+
+
+@pytest.mark.parametrize("call", [
+    lambda s: s.shutdown("pve1", caller="ui"),
+    lambda s: s.shutdown("all", caller="ui", confirm=True),
+    lambda s: s.reboot("pi", caller="ui", confirm=True),
+])
+async def test_attempt_audit_fails_closed(repo, audit, actions, runner, call):
+    svc = make_service(repo, BrokenAudit(audit), actions, runner)
+    with pytest.raises(AuditUnavailable):
+        await call(svc)
+    assert actions.calls == []
+
+
+async def test_result_row_failure_still_swallowed(repo, audit, actions, runner):
+    class FailAfterAttempt(BrokenAudit):
+        def record(self, caller, target, action, result):
+            if result.startswith("attempt"):
+                return self.inner.record(caller, target, action, result)
+            raise RuntimeError("disk full")
+    svc = make_service(repo, FailAfterAttempt(audit), actions, runner)
+    res = await svc.shutdown("pve1", caller="ui")
+    assert res["pve1"]["ok"] is True
+
+
+@pytest.mark.parametrize("cmd,secret,keep", [
+    ("sshpass -p secret ssh root@h", "secret", "sshpass -p *** ssh"),
+    ("mysql -u root -p hunter2 db", "hunter2", "-p ***"),
+    ("mysql -p'my secret' db", "my secret", "-p***"),
+    ('mysql -p"my secret" db', "my secret", "-p***"),
+    ("tool -p'quoted' x", "quoted", "-p***"),
+    ("app --password 'two words'", "two words", "--password ***"),
+    ('app --token "a b c"', "a b c", "--token ***"),
+    ("env password='x y z' run", "x y z", "password=***"),
+    ('env secret="s p" run', "s p", "secret=***"),
+    ("env passwd='q' token='w w'", "w w", "token=***"),
+    ("git clone https://bob:pa55@github.com/x.git", "pa55", "https://bob:***@github.com"),
+    ("curl -u admin:letmein http://h", "letmein", "-u admin:***"),
+    ("curl --user admin:letmein http://h", "letmein", "--user admin:***"),
+    ('curl -u "admin:let me in" http://h', "me in", '-u "admin:***"'),
+    ("curl -H 'X: Bearer tok123' http://h", "tok123", "Bearer ***"),
+    ("echo Bearer abc.def", "abc.def", "Bearer ***"),
+])
+def test_redact_cmd_cases(cmd, secret, keep):
+    out = redact_cmd(cmd)
+    assert secret not in out, out
+    assert keep in out, out
+
+
+@pytest.mark.parametrize("cmd", [
+    "find / -name x -print", "ssh -p 22 host", "ls -u x:y", "mkdir -p /tmp/a",
+    "psql-less -print", "uptime",
+])
+def test_redact_cmd_leaves_harmless_commands(cmd):
+    assert redact_cmd(cmd) == cmd
