@@ -56,10 +56,11 @@ def test_parse_ethtool_wol_d_flags_not_ready():
 
 async def test_wol_check_ready_by_mac_case_insensitive():
     r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
-                    "grep": ok("/etc/systemd/network/10-eno1.link")})
+                    "grep": ok("/etc/systemd/network/10-eno1.link:WakeOnLan=magic")})
     rep = await wol_check(r, dev(mac="AA:BB:CC:DD:EE:01"))
     assert rep.nic == "eno1" and rep.supported and rep.current_flags == "g"
-    assert rep.persistent is True and rep.notes == []
+    assert rep.persistent is True
+    assert rep.notes == ["persistence is a config-file heuristic, not verified at boot"]
 
 
 async def test_wol_check_captures_mac_when_missing():
@@ -157,6 +158,133 @@ async def test_wake_test_stamps_pass_result(conn):
     assert audit.list()[0]["action"] == "wake_test" and audit.list()[0]["caller"] == "ui"
 
 
+async def _seed(conn):
+    repo = DeviceRepo(conn)
+    d = repo.add(dev(mac="aa:bb:cc:dd:ee:01"))
+    d.wake_test_result, d.wake_test_at = "pass", 7.0
+    repo.update(d)
+    return repo, AuditLog(conn), d
+
+
+async def test_wake_test_lock_rejection_not_stamped(conn):
+    repo, audit, d = await _seed(conn)
+    a = FakeActions(ActionResult(False, [StageResult("lock", False, "action in progress")]))
+    res = await wake_test(a, repo, audit, d, now=lambda: 99.0)
+    assert not res.ok and a.calls == ["shutdown"]
+    got = repo.get("box")
+    assert (got.wake_test_result, got.wake_test_at) == ("pass", 7.0)
+    assert audit.list()[0]["result"] == "not run: action in progress"
+
+
+async def test_wake_test_already_down_not_stamped(conn):
+    repo, audit, d = await _seed(conn)
+    a = FakeActions(ActionResult(False, [StageResult("precheck", False, "already down")]))
+    await wake_test(a, repo, audit, d, now=lambda: 99.0)
+    assert repo.get("box").wake_test_result == "pass"
+    assert audit.list()[0]["result"] == "not run: already down"
+
+
+async def test_wake_test_real_shutdown_failure_stamps_detail(conn):
+    repo, audit, d = await _seed(conn)
+    a = FakeActions(ActionResult(False, [StageResult("precheck", True),
+                                         StageResult("down", False, "host still up after 120s")]))
+    await wake_test(a, repo, audit, d, now=lambda: 99.0)
+    assert a.calls == ["shutdown"]
+    assert repo.get("box").wake_test_result == "fail: shutdown: host still up after 120s"
+
+
+class RaisingActions(FakeActions):
+    def __init__(self, on, exc, shutdown_res=GOOD):
+        super().__init__(shutdown_res)
+        self.on, self.exc = on, exc
+
+    async def shutdown(self, device, mode=None, progress=None):
+        if self.on == "shutdown":
+            raise self.exc
+        return await super().shutdown(device, mode, progress)
+
+    async def wake(self, device, progress=None):
+        raise self.exc
+
+
+async def test_wake_test_shutdown_exception_stamps_and_reraises(conn):
+    repo, audit, d = await _seed(conn)
+    with pytest.raises(ConnectFailed):
+        await wake_test(RaisingActions("shutdown", ConnectFailed("no route")), repo, audit, d,
+                        now=lambda: 3.0)
+    assert repo.get("box").wake_test_result == "error: no route"
+    assert audit.list()[0]["result"] == "error: no route"
+
+
+async def test_wake_test_wake_exception_stamps_and_reraises(conn):
+    repo, audit, d = await _seed(conn)
+    with pytest.raises(ConnectFailed):
+        await wake_test(RaisingActions("wake", ConnectFailed("boom")), repo, audit, d,
+                        now=lambda: 3.0)
+    assert repo.get("box").wake_test_result == "error: boom"
+
+
+async def test_wake_test_cancelled_after_shutdown_stamps(conn):
+    import asyncio
+    repo, audit, d = await _seed(conn)
+    with pytest.raises(asyncio.CancelledError):
+        await wake_test(RaisingActions("wake", asyncio.CancelledError()), repo, audit, d,
+                        now=lambda: 3.0)
+    assert repo.get("box").wake_test_result == "error: cancelled"
+
+
+async def test_wake_test_wake_lock_is_error_not_fail(conn):
+    repo, audit, d = await _seed(conn)
+    lock = ActionResult(False, [StageResult("lock", False, "action in progress")])
+    await wake_test(FakeActions(GOOD, lock), repo, audit, d, now=lambda: 3.0)
+    assert repo.get("box").wake_test_result == "error: wake not run: action in progress"
+
+
+async def test_wake_test_device_deleted_midway_skips_update(conn):
+    repo, audit, d = await _seed(conn)
+
+    class Deleting(FakeActions):
+        async def wake(self, device, progress=None):
+            repo.remove("box")
+            return await super().wake(device, progress)
+
+    await wake_test(Deleting(GOOD, WAKE_OK), repo, audit, d)
+    assert repo.get("box") is None
+    assert "not stamped" in audit.list()[0]["result"]
+
+
+async def test_wol_check_persistence_false_positive_unrelated_wol():
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
+                    "grep": ok("/etc/network/interfaces:post-up ethtool -s eth9 wol g\n"
+                               "/etc/systemd/network/a.link:Name=eth9")})
+    rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
+    assert rep.persistent is False
+
+
+async def test_wol_check_persistence_true_adds_heuristic_note():
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
+                    "grep": ok("/etc/network/interfaces:post-up ethtool -s eno1 wol g")})
+    rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
+    assert rep.persistent is True
+    assert "persistence is a config-file heuristic, not verified at boot" in rep.notes
+
+
+async def test_wol_check_grep_uses_sudo_and_nic_for_non_root():
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()), "grep": RunResult("", "", 1)})
+    await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01", ssh_user="bob"))
+    g = next(c for c in r.cmds if "grep" in c)
+    assert g.startswith("sudo -n grep") and "eno1" in g
+
+
+async def test_wol_check_sys_class_net_mac_fallback():
+    link = "1: lo: <LOOPBACK> mtu 1\\    link/loopback 00:00:00:00:00:00 brd 00:00:00:00:00:00\n"
+    r = FakeRunner({"ip -o link": ok(link), "route get": ok(ROUTE),
+                    "/sys/class/net/eno1/address": ok("AA:BB:CC:DD:EE:01\n"),
+                    "ethtool": ok(ethtool()), "grep": RunResult("", "", 1)})
+    rep = await wol_check(r, dev())
+    assert rep.nic == "eno1" and rep.mac == "aa:bb:cc:dd:ee:01"
+
+
 async def test_wake_test_stamps_fail_when_never_wakes(conn):
     repo, audit = DeviceRepo(conn), AuditLog(conn)
     d = repo.add(dev(mac="aa:bb:cc:dd:ee:01"))
@@ -170,10 +298,10 @@ async def test_wake_test_stamps_fail_when_never_wakes(conn):
 async def test_wake_test_shutdown_failure_skips_wake(conn):
     repo, audit = DeviceRepo(conn), AuditLog(conn)
     d = repo.add(dev())
-    a = FakeActions(ActionResult(False, [StageResult("precheck", False, "already down")]))
+    a = FakeActions(ActionResult(False, [StageResult("down", False, "host still up")]))
     res = await wake_test(a, repo, audit, d, now=lambda: 1.0)
     assert not res.ok and a.calls == ["shutdown"]
-    assert repo.get("box").wake_test_result == "fail: shutdown failed"
+    assert repo.get("box").wake_test_result == "fail: shutdown: host still up"
 
 
 async def test_wake_test_refuses_self(conn):

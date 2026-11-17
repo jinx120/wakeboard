@@ -3,6 +3,7 @@
 NIC names come from remote output, so they are validated before they reach a
 command line and quoted with shlex.quote.
 """
+import asyncio
 import re
 import shlex
 import time
@@ -119,18 +120,36 @@ async def wol_check(runner, device: Device) -> WolReport:
         rep.notes.append(f"{nic} supports WoL but it is not enabled (current: {cur or '?'}); "
                          f"run: ethtool -s {nic} wol g")
 
+    ident = [re.escape(nic)] + ([re.escape(rep.mac)] if rep.mac else [])
+    pattern = "|".join(["wol", "wake-on", *ident])
     g = await runner.run(
-        device, f"grep -rIsilE 'wol|wake-on' {_PERSIST_PATHS}")
+        device, _priv(device, f"grep -rIsiE {shlex.quote(pattern)} {_PERSIST_PATHS}"))
     if g.exit == 0:
-        rep.persistent = True
+        rep.persistent = _persists(g.stdout, ident)
+        if rep.persistent:
+            rep.notes.append("persistence is a config-file heuristic, not verified at boot")
     elif g.exit == 1:
         rep.persistent = False
-        if rep.supported:
-            rep.notes.append("WoL setting does not appear to persist across reboots "
-                             "(no wol config found in systemd/networkd/ifupdown)")
     else:
         rep.notes.append(f"could not check WoL persistence ({_short(g)})")
+    if rep.persistent is False and rep.supported:
+        rep.notes.append("WoL setting does not appear to persist across reboots "
+                         "(no wol config mentioning this NIC found in systemd/networkd/ifupdown)")
     return rep
+
+
+def _persists(grep_out: str, ident: list[str]) -> bool:
+    """True if some single file mentions both wol/wake-on and this NIC or MAC."""
+    wol: set[str] = set()
+    nic: set[str] = set()
+    ident_re = re.compile("|".join(ident), re.I)
+    for line in grep_out.splitlines():
+        path, _, text = line.partition(":")
+        if re.search(r"wol|wake-on", text, re.I):
+            wol.add(path)
+        if ident_re.search(text) or ident_re.search(path):
+            nic.add(path)
+    return bool(wol & nic)
 
 
 def adopt_mac(repo, device: Device, report: WolReport) -> bool:
@@ -142,32 +161,63 @@ def adopt_mac(repo, device: Device, report: WolReport) -> bool:
     return True
 
 
+_NOT_RUN = ("lock", "precheck")
+
+
+def _failed(res: ActionResult) -> StageResult | None:
+    return next((st for st in res.stages if not st.ok), None)
+
+
 async def wake_test(actions, repo, audit, device: Device, caller: str = "ui",
                     now=time.time) -> ActionResult:
-    """Shut the device down, wake it, and stamp the outcome on the device."""
+    """Shut the device down, wake it, and stamp the outcome on the device.
+
+    A shutdown rejected by lock/precheck means the test never ran: nothing is
+    stamped. Exceptions stamp "error: ..." and re-raise.
+    """
     if device.is_self:
         return ActionResult(ok=False, stages=[StageResult(
             "precheck", False, "refusing to wake-test the host Wakeboard runs on")])
 
+    def stamp(result: str) -> None:
+        fresh = repo.get(device.name)
+        if fresh is None:
+            audit.record(caller, device.name, "wake_test",
+                         f"{result} (not stamped: device no longer exists)")
+            return
+        fresh.wake_test_result = result
+        fresh.wake_test_at = now()
+        repo.update(fresh)
+        audit.record(caller, device.name, "wake_test", result)
+
     stages: list[StageResult] = []
-    down = await actions.shutdown(device)
-    stages.extend(down.stages)
-    if not down.ok:
-        result = "fail: shutdown failed"
-        res = ActionResult(ok=False, stages=stages)
-    else:
+    shut_down = False
+    try:
+        down = await actions.shutdown(device)
+        stages.extend(down.stages)
+        if not down.ok:
+            bad = _failed(down)
+            if bad is not None and bad.stage in _NOT_RUN:
+                audit.record(caller, device.name, "wake_test",
+                             f"not run: {bad.detail or bad.stage}")
+                return down
+            stamp(f"fail: shutdown: {(bad.detail or bad.stage) if bad else 'unknown'}")
+            return ActionResult(ok=False, stages=stages)
+        shut_down = True
         up = await actions.wake(device)
         stages.extend(up.stages)
-        res = ActionResult(ok=up.ok, stages=stages)
+        bad = _failed(up)
         if up.ok:
-            result = "pass"
+            stamp("pass")
+        elif bad is not None and bad.stage == "lock":
+            stamp(f"error: wake not run: {bad.detail or bad.stage}")
         else:
-            failed = next((s for s in up.stages if not s.ok), None)
-            result = f"fail: {failed.detail or failed.stage}" if failed else "fail: wake failed"
-
-    fresh = repo.get(device.name) or device
-    fresh.wake_test_result = result
-    fresh.wake_test_at = now()
-    repo.update(fresh)
-    audit.record(caller, device.name, "wake_test", result)
-    return res
+            stamp(f"fail: {(bad.detail or bad.stage) if bad else 'wake failed'}")
+        return ActionResult(ok=up.ok, stages=stages)
+    except asyncio.CancelledError:
+        if shut_down:
+            stamp("error: cancelled")
+        raise
+    except Exception as e:
+        stamp(f"error: {e or type(e).__name__}")
+        raise
