@@ -29,13 +29,13 @@ class KeyStore:
         self.key_dir = self.data_dir / "keys"
 
     def _ensure_dir(self) -> None:
-        self.key_dir.mkdir(parents=True, exist_ok=True)
+        self.key_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(self.key_dir, 0o700)
 
     def private_path(self, key_id: str | None = None) -> Path:
         if key_id is None:
             return self.key_dir / GLOBAL_KEY_NAME
-        if not _KEY_ID_RE.match(key_id) or key_id == GLOBAL_KEY_NAME:
+        if not _KEY_ID_RE.fullmatch(key_id) or key_id == GLOBAL_KEY_NAME:
             raise ValueError(f"invalid key id: {key_id!r}")
         return self.key_dir / key_id
 

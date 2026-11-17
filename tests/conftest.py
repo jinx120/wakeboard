@@ -42,8 +42,12 @@ class FakeSshServer:
     - authorized_keys: set of OpenSSH public-key lines accepted for pubkey auth
       (keys found in ``home/.ssh/authorized_keys`` are also accepted).
     - password: accepted password (None disables password auth).
-    - responses: exact command -> Canned; commands not listed run via ``bash -c``
-      with HOME set to ``home`` (a temp dir), so enrollment shell lines are real.
+    - responses: exact command -> Canned.
+    - shell_allowlist: exact command strings that are really executed via
+      ``bash -c`` with HOME set to ``home`` (a temp dir); tests add only the
+      KeyStore.authorize_command() line so enrollment is exercised for real.
+    - Any other command is NEVER executed: it returns exit 127 with
+      "command not found" (so e.g. ``shutdown -h now`` cannot touch the test host).
     - commands: every command received, in order.
     - auth_log: (method, username) tuples for successful auths.
     """
@@ -55,6 +59,7 @@ class FakeSshServer:
     authorized_keys: set = dc_field(default_factory=set)
     password: str | None = None
     responses: dict = dc_field(default_factory=dict)
+    shell_allowlist: set = dc_field(default_factory=set)
     commands: list = dc_field(default_factory=list)
     auth_log: list = dc_field(default_factory=list)
 
@@ -121,6 +126,8 @@ async def ssh_server(tmp_path):
         cmd = process.command or ""
         ctl.commands.append(cmd)
         canned = ctl.responses.get(cmd)
+        if canned is None and cmd not in ctl.shell_allowlist:
+            canned = Canned(b"", f"bash: {cmd.split()[0] if cmd.split() else cmd}: command not found\n".encode(), 127)
         if canned is None:
             env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")}
             proc = await asyncio.create_subprocess_exec(

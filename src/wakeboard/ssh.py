@@ -14,6 +14,10 @@ class HostKeyChanged(Exception):
     pass
 
 
+class PinnedHostKeyCorrupt(HostKeyChanged):
+    """A known_hosts entry exists for the host but cannot be parsed (fail closed)."""
+
+
 class SudoRequired(Exception):
     pass
 
@@ -30,7 +34,9 @@ class RunResult:
 
 
 def _entry(host: str, port: int) -> str:
-    return f"[{host}]:{port}"
+    if not host or any(c.isspace() for c in host):
+        raise ValueError(f"invalid host: {host!r}")
+    return f"[{host}]:{int(port)}"
 
 
 def _decode(v) -> str:
@@ -92,11 +98,17 @@ class SshRunner:
         keys = []
         for ln in self._read_lines():
             parts = ln.split(None, 1)
-            if len(parts) == 2 and parts[0] == entry:
-                try:
-                    keys.append(asyncssh.import_public_key(parts[1]))
-                except (asyncssh.KeyImportError, ValueError):
-                    continue
+            if parts[0] != entry:
+                continue
+            try:
+                if len(parts) != 2:
+                    raise ValueError("missing key")
+                keys.append(asyncssh.import_public_key(parts[1]))
+            except (asyncssh.KeyImportError, ValueError):
+                # An entry exists but is unreadable: treat as pinned and refuse,
+                # never silently re-pin. acknowledge_host_key() is the recovery path.
+                raise PinnedHostKeyCorrupt(
+                    f"pinned host key for {entry} is unreadable; acknowledge to re-pin") from None
         return keys
 
     def _pin(self, device: Device, key: asyncssh.SSHKey) -> None:

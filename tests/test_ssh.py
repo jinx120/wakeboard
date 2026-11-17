@@ -5,7 +5,7 @@ import pytest
 
 from conftest import Canned
 from wakeboard.devices import Device
-from wakeboard.ssh import HostKeyChanged, RunResult, SshRunner
+from wakeboard.ssh import EnrollmentFailed, HostKeyChanged, RunResult, SshRunner
 from wakeboard.sshkeys import KeyStore
 
 PASSWORD = "s3cret-Enroll-Pw!"
@@ -61,6 +61,11 @@ def test_global_key_created_0600_and_idempotent(tmp_path):
 def test_private_path_rejects_traversal(keystore):
     with pytest.raises(ValueError):
         keystore.private_path("../evil")
+
+
+def test_private_path_rejects_trailing_newline(keystore):
+    with pytest.raises(ValueError):
+        keystore.private_path("abc\n")
 
 
 def test_authorize_command_contains_pubkey(keystore):
@@ -142,6 +147,7 @@ async def test_acknowledge_leaves_other_hosts_pinned(runner, device, authorized,
 
 async def test_enroll_with_password_installs_key_then_key_login_works(
         runner, device, ssh_server, keystore, tmp_path):
+    ssh_server.shell_allowlist.add(keystore.authorize_command())
     ssh_server.password = PASSWORD
     await runner.enroll_with_password(device, PASSWORD)
     assert ("password", "root") in ssh_server.auth_log
@@ -162,6 +168,7 @@ async def test_enroll_with_password_installs_key_then_key_login_works(
 
 async def test_enroll_twice_does_not_duplicate_key(runner, device, ssh_server, keystore, caplog):
     caplog.set_level("DEBUG")
+    ssh_server.shell_allowlist.add(keystore.authorize_command())
     ssh_server.password = PASSWORD
     await runner.enroll_with_password(device, PASSWORD)
     await runner.enroll_with_password(device, PASSWORD)
@@ -173,7 +180,7 @@ async def test_enroll_twice_does_not_duplicate_key(runner, device, ssh_server, k
 async def test_enroll_wrong_password_error_hides_password(runner, device, ssh_server, caplog):
     caplog.set_level("DEBUG")
     ssh_server.password = "the-right-one"
-    with pytest.raises(Exception) as ei:
+    with pytest.raises(EnrollmentFailed) as ei:
         await runner.enroll_with_password(device, PASSWORD)
     assert PASSWORD not in str(ei.value)
     assert PASSWORD not in repr(ei.value)
@@ -206,3 +213,39 @@ async def test_sudo_ok_false_when_prompt_required(runner, ssh_server, keystore):
 async def test_sudo_ok_true_for_root_without_running_sudo(runner, device, authorized):
     assert await runner.sudo_ok(device) is True
     assert "sudo -n true" not in authorized.commands
+
+
+async def test_unknown_command_is_not_executed(runner, device, authorized, tmp_path):
+    marker = tmp_path / "should_not_exist"
+    r = await runner.run(device, f"touch {marker}")
+    assert r.exit == 127
+    assert "command not found" in r.stderr
+    assert not marker.exists()
+    r = await runner.run(device, "shutdown -h now")
+    assert r.exit == 127
+    assert "command not found" in r.stderr
+    assert authorized.commands[-1] == "shutdown -h now"
+
+
+async def test_corrupt_pinned_entry_fails_closed(runner, device, authorized, known_hosts):
+    authorized.responses["true"] = Canned()
+    known_hosts.parent.mkdir(parents=True, exist_ok=True)
+    corrupt = f"[{device.host}]:{device.ssh_port} ssh-ed25519 not-base64!!\n"
+    known_hosts.write_text(corrupt)
+    with pytest.raises(HostKeyChanged):
+        await runner.run(device, "true")
+    device.host_key_ack = True
+    with pytest.raises(HostKeyChanged):
+        await runner.run(device, "true")
+    assert known_hosts.read_text() == corrupt
+    assert authorized.commands == []
+
+
+@pytest.mark.parametrize("bad", ["evil host", "evil\nhost", "evil\thost", ""])
+async def test_host_with_whitespace_rejected(runner, bad, known_hosts):
+    dev = Device(name="x", host=bad, ssh_port=22)
+    with pytest.raises(ValueError):
+        await runner.run(dev, "true")
+    with pytest.raises(ValueError):
+        runner.acknowledge_host_key(dev)
+    assert not known_hosts.exists()
