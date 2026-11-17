@@ -6,6 +6,7 @@ import os
 import threading
 
 from fastapi import FastAPI
+from starlette.routing import Route
 
 from wakeboard.actions import Actions
 from wakeboard.api import build_api_router
@@ -13,6 +14,7 @@ from wakeboard.audit import AuditLog
 from wakeboard.auth import AuthStore
 from wakeboard.config import Settings
 from wakeboard.db import connect
+from wakeboard.mcp_server import build_mcp
 from wakeboard.devices import DeviceRepo
 from wakeboard.service import HostKeyAckRunner, LockedAudit, LockedRepo, Service
 from wakeboard.ssh import SshRunner
@@ -22,9 +24,17 @@ from wakeboard.status import Poller, Prober
 log = logging.getLogger(__name__)
 
 
+def mount_mcp(app: FastAPI, mcp_app) -> None:
+    """Serve the (already authenticated) MCP ASGI app at exactly /mcp (and /mcp/),
+    with no redirect. Its session manager is run by create_app's lifespan."""
+    for path in ("/mcp", "/mcp/"):
+        app.router.routes.append(Route(path, endpoint=mcp_app))
+    app.state.mcp = mcp_app
+
+
 def mount_extras(app: FastAPI, service: Service, auth: AuthStore) -> None:
-    """Hook for the MCP server (Task 10, mounted at /mcp) and the web UI router
-    (Task 11). No-op until those exist."""
+    """Plug-in point for the MCP server (/mcp) and the web UI router (Task 11)."""
+    mount_mcp(app, build_mcp(service, auth))
 
 
 def create_app(settings: Settings | None = None, *, prober=None, poller: Poller | None = None,
@@ -56,7 +66,10 @@ def create_app(settings: Settings | None = None, *, prober=None, poller: Poller 
         task = asyncio.create_task(poller.run(repo, prober, state, settings.poll_interval))
         app.state.poller_task = task
         try:
-            yield
+            mcp_app = getattr(app.state, "mcp", None)
+            async with (mcp_app.session_manager.run() if mcp_app is not None
+                        else contextlib.nullcontext()):
+                yield
         finally:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
