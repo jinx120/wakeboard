@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}Settings{% endblock %}
+{% block content %}
+<h1>Settings</h1>
+
+<section class="card">
+  <h2>MCP / API token</h2>
+  {% if new_token %}
+  <p class="msg warn">Copy it now: this token is shown only once and cannot be displayed again.</p>
+  <pre class="cmd" id="new-token">{{ new_token }}</pre>
+  {% else %}
+  <p>The token is stored only as a hash and cannot be shown. Rotating it creates a new one and
+    invalidates the old one immediately.</p>
+  {% endif %}
+  <form method="post" action="/settings">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="op" value="rotate_token">
+    <button type="submit">Rotate token</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Change password</h2>
+  {% if pw_error %}<p class="msg bad">{{ pw_error }}</p>{% endif %}
+  {% if pw_message %}<p class="msg ok">{{ pw_message }}</p>{% endif %}
+  <form method="post" action="/settings">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="op" value="password">
+    <label>Current password <input type="password" name="current" autocomplete="current-password" required></label>
+    <label>New password <input type="password" name="new" autocomplete="new-password" minlength="8" required></label>
+    <label>Repeat new password <input type="password" name="confirm" autocomplete="new-password" minlength="8" required></label>
+    <button type="submit" class="primary">Change password</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Wakeboard SSH public key</h2>
+  {% if pubkey %}<pre class="cmd">{{ pubkey }}</pre>{% else %}<p class="msg bad">unavailable: the key could not be read.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Defaults (read-only)</h2>
+  <dl class="info">
+    <dt>Status poll interval</dt><dd>{{ settings.poll_interval }} s</dd>
+    <dt>Wake timeout</dt><dd>{{ settings.wake_timeout }} s</dd>
+    <dt>Guest shutdown timeout</dt><dd>{{ settings.guest_timeout }} s</dd>
+    <dt>Shutdown timeout</dt><dd>{{ settings.shutdown_timeout }} s</dd>
+  </dl>
+</section>
+{% endblock %}

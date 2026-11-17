@@ -1,0 +1,119 @@
+{% extends "base.html" %}
+{% set p = "/devices/" ~ d.name|q %}
+{% block title %}{{ d.name }}{% endblock %}
+{% block content %}
+<h1>{{ d.name }} <span class="badge {{ dev_status }}">{{ dev_status }}</span>
+  {% if is_self %}<span class="badge warn">self: hosts Wakeboard</span>{% endif %}</h1>
+{% if is_self %}
+<p class="msg warn">This is the machine Wakeboard runs on (or hosts it). Shutting it down takes
+  Wakeboard offline, and Wakeboard cannot wake its own host.</p>
+{% endif %}
+
+<section class="card">
+  <h2>Actions</h2>
+  <div class="row">
+    <form method="post" action="{{ p }}/wake" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" hx-post="{{ p }}/wake" hx-target="#result">Wake</button>
+    </form>
+    {% if is_self %}
+    <a class="btn danger" href="/confirm/shutdown?target={{ d.name|q }}">Shutdown...</a>
+    <a class="btn danger" href="/confirm/reboot?target={{ d.name|q }}">Reboot...</a>
+    {% else %}
+    <form method="post" action="{{ p }}/shutdown" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="danger" hx-post="{{ p }}/shutdown" hx-target="#result"
+              hx-confirm="Shut down {{ d.name }}?">Shutdown</button>
+    </form>
+    <form method="post" action="{{ p }}/reboot" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="danger" hx-post="{{ p }}/reboot" hx-target="#result"
+              hx-confirm="Reboot {{ d.name }}?">Reboot</button>
+    </form>
+    {% endif %}
+    <a class="btn" href="{{ p }}/edit">Edit</a>
+  </div>
+</section>
+
+<section class="card">
+  <h2>Info</h2>
+  <dl class="info">
+    <dt>Host</dt><dd>{{ d.ssh_user }}@{{ d.host }}:{{ d.ssh_port }}</dd>
+    <dt>Type</dt><dd>{{ d.type }} ({{ d.shutdown_mode }})</dd>
+    <dt>MAC</dt><dd>{{ d.mac or "not set" }}{% if d.broadcast %} via {{ d.broadcast }}{% endif %}</dd>
+    <dt>Groups</dt><dd>{{ d.groups|join(", ") or "-" }}</dd>
+    {% if info %}
+    <dt>Uptime</dt><dd>{{ info.uptime_s|uptime }}</dd>
+    <dt>Load</dt><dd>{{ info.load1 }}</dd>
+    <dt>Memory</dt><dd>{{ info.mem_used_pct }}%</dd>
+    <dt>Disk /</dt><dd>{{ info.disk_root_pct }}%</dd>
+    {% if info.cpu_temp_c is not none %}<dt>CPU temp</dt><dd>{{ info.cpu_temp_c }} C</dd>{% endif %}
+    <dt>Kernel</dt><dd>{{ info.kernel }}</dd>
+    {% if info.pve_version %}<dt>Proxmox</dt><dd>{{ info.pve_version }} ({{ info.vms_running }} VMs, {{ info.cts_running }} CTs running)</dd>{% endif %}
+    {% else %}
+    <dt>Live info</dt><dd>unavailable: {{ info_error }}</dd>
+    {% endif %}
+    <dt>Wake test</dt><dd>{{ d.wake_test_result or "never run" }}</dd>
+    {% if d.notes %}<dt>Notes</dt><dd class="pre">{{ d.notes }}</dd>{% endif %}
+  </dl>
+</section>
+
+<section class="card">
+  <h2>SSH enrollment</h2>
+  <p>Option A: run this on {{ d.name }} as {{ d.ssh_user }} to install the Wakeboard key:</p>
+  {% if enroll_cmd %}
+  <pre class="cmd">{{ enroll_cmd }}</pre>
+  <p class="hint">Public key: <code>{{ pubkey }}</code></p>
+  {% else %}
+  <p class="msg bad">unavailable: the Wakeboard key could not be read.</p>
+  {% endif %}
+  <p>Option B: enroll with the password once. It is used for this one connection and never stored.</p>
+  <form method="post" action="{{ p }}/enroll">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>SSH password for {{ d.ssh_user }}@{{ d.host }}
+      <input type="password" name="password" autocomplete="off" required></label>
+    <button type="submit" hx-post="{{ p }}/enroll" hx-target="#result">Enroll with password once</button>
+  </form>
+  <form method="post" action="{{ p }}/ack-host-key" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" hx-post="{{ p }}/ack-host-key" hx-target="#result"
+            hx-confirm="Accept the new host key of {{ d.name }}? Only do this if you know why it changed.">Acknowledge changed host key</button>
+  </form>
+</section>
+
+<section class="card">
+  <h2>Wake-on-LAN</h2>
+  <div class="row">
+    <form method="post" action="{{ p }}/wol-check" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" hx-post="{{ p }}/wol-check" hx-target="#result">WoL check</button>
+    </form>
+    <form method="post" action="{{ p }}/wake-test" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <button type="submit" class="danger" hx-post="{{ p }}/wake-test" hx-target="#result"
+              hx-confirm="Run wake test: this shuts {{ d.name }} down and wakes it again. Continue?">Run wake test</button>
+    </form>
+  </div>
+</section>
+
+<section class="card">
+  <h2>History</h2>
+  {% if history %}
+  <table class="audit">
+    <thead><tr><th>Time (UTC)</th><th>Caller</th><th>Action</th><th>Result</th></tr></thead>
+    <tbody>
+    {% for row in history %}<tr><td>{{ row.ts }}</td><td>{{ row.caller }}</td><td>{{ row.action }}</td><td>{{ row.result }}</td></tr>{% endfor %}
+    </tbody>
+  </table>
+  {% else %}<p>No history yet.</p>{% endif %}
+</section>
+
+<section class="card">
+  <h2>Remove</h2>
+  <form method="post" action="{{ p }}/delete" class="inline">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <button type="submit" class="danger" hx-post="{{ p }}/delete"
+            hx-confirm="Remove {{ d.name }} from Wakeboard? The machine itself is not touched.">Remove device</button>
+  </form>
+</section>
+{% endblock %}

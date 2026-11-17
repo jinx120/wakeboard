@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% set verb = "Shut down" if action == "shutdown" else "Reboot" %}
+{% block title %}Confirm {{ action }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+  <h1>Confirm: {{ verb }} {{ target }}</h1>
+  {% if bulk %}
+  <p>This will {{ verb|lower }} {{ affected|length }} device(s):</p>
+  <ul>{% for n in affected %}<li>{{ n }}</li>{% endfor %}</ul>
+  {% if excluded %}
+  <p class="msg warn">Excluded because they run or host Wakeboard: {{ excluded|join(", ") }}.
+    Open a device to target it on its own.</p>
+  {% endif %}
+  {% else %}
+  {% if is_self %}
+  <p class="msg warn"><strong>WARNING:</strong> {{ target }} is the machine Wakeboard runs on (or hosts it).
+    {{ verb }}ing it takes Wakeboard offline, and Wakeboard cannot wake its own host.</p>
+  {% endif %}
+  <p>This will {{ verb|lower }} {{ target }}.</p>
+  {% endif %}
+  <form method="post" action="{{ post_to }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="target" value="{{ target }}">
+    <input type="hidden" name="confirm" value="1">
+    <button type="submit" class="danger" hx-post="{{ post_to }}" hx-target="#result"
+            hx-confirm="{{ verb }} {{ target }} now?">Yes, {{ verb|lower }} {{ target }}</button>
+    <a class="btn" href="/">Cancel</a>
+  </form>
+</section>
+{% endblock %}

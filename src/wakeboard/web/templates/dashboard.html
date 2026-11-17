@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Devices{% endblock %}
+{% block content %}
+<h1>Devices</h1>
+<section class="bulk card">
+  <h2>Bulk actions</h2>
+  <p class="hint">Devices that run or host Wakeboard are left out of bulk actions.</p>
+  <div class="row">
+    <form method="post" action="/bulk/wake" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="target" value="all">
+      <button type="submit" hx-post="/bulk/wake" hx-target="#result">Wake all</button>
+    </form>
+    <a class="btn danger" href="/confirm/shutdown?target=all">Shut down all...</a>
+    <a class="btn danger" href="/confirm/reboot?target=all">Reboot all...</a>
+  </div>
+  {% for g in groups %}
+  <div class="row">
+    <span class="group">{{ g }}</span>
+    <form method="post" action="/bulk/wake" class="inline">
+      <input type="hidden" name="csrf" value="{{ csrf }}">
+      <input type="hidden" name="target" value="{{ g }}">
+      <button type="submit" hx-post="/bulk/wake" hx-target="#result">Wake {{ g }}</button>
+    </form>
+    <a class="btn danger" href="/confirm/shutdown?target={{ g|q }}">Shut down {{ g }}...</a>
+    <a class="btn danger" href="/confirm/reboot?target={{ g|q }}">Reboot {{ g }}...</a>
+  </div>
+  {% endfor %}
+</section>
+{% include "_cards.html" %}
+{% endblock %}

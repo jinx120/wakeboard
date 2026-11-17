@@ -1,0 +1,32 @@
+<div id="cards" class="cards" hx-get="/partials/cards" hx-trigger="every 5s" hx-swap="outerHTML">
+{% for d in devices %}
+  {% set state = "up" if d.up is true else ("down" if d.up is false else "unknown") %}
+  <article class="card device {{ state }}">
+    <header>
+      <a class="name" href="/devices/{{ d.name|q }}">{{ d.name }}</a>
+      <span class="badge {{ state }}">{{ state }}</span>
+      {% if d.is_self %}<span class="badge warn" title="Runs or hosts Wakeboard">self: hosts Wakeboard</span>{% endif %}
+    </header>
+    <p class="meta">{{ d.host }} &middot; {{ d.type }}{% if d.groups %} &middot; {{ d.groups|join(", ") }}{% endif %}</p>
+    <p class="meta">Uptime: {{ d.info.uptime_s|uptime if d.info else "-" }}</p>
+    <div class="row">
+      <form method="post" action="/devices/{{ d.name|q }}/wake" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" hx-post="/devices/{{ d.name|q }}/wake" hx-target="#result">Wake</button>
+      </form>
+      {% if d.is_self %}
+      <a class="btn danger" href="/confirm/shutdown?target={{ d.name|q }}">Shutdown...</a>
+      <a class="btn danger" href="/confirm/reboot?target={{ d.name|q }}">Reboot...</a>
+      {% else %}
+      <form method="post" action="/devices/{{ d.name|q }}/shutdown" class="inline">
+        <input type="hidden" name="csrf" value="{{ csrf }}">
+        <button type="submit" class="danger" hx-post="/devices/{{ d.name|q }}/shutdown" hx-target="#result"
+                hx-confirm="Shut down {{ d.name }}?">Shutdown</button>
+      </form>
+      {% endif %}
+    </div>
+  </article>
+{% else %}
+  <p>No devices yet. <a href="/devices/new">Add one</a>.</p>
+{% endfor %}
+</div>

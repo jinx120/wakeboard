@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}{{ "Edit " ~ device.name if editing else "Add device" }}{% endblock %}
+{% block content %}
+<section class="card narrow">
+  {% if editing %}
+  <h1>Edit {{ device.name }}</h1>
+  {% else %}
+  <h1>Add a device</h1>
+  <p class="hint">Step 1 of 2: describe the machine. Next you install the Wakeboard SSH key on it
+    (paste a command, or enroll once with its password).</p>
+  {% endif %}
+  {% if error %}<p class="msg bad">{{ error }}</p>{% endif %}
+  <form method="post" action="{{ '/devices/' ~ device.name|q ~ '/edit' if editing else '/devices/new' }}">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Name <input name="name" value="{{ form.name or '' }}" required maxlength="64"></label>
+    <label>Host (IP or hostname) <input name="host" value="{{ form.host or '' }}" required maxlength="253"></label>
+    <label>SSH user <input name="ssh_user" value="{{ form.ssh_user or 'root' }}" maxlength="32"></label>
+    <label>SSH port <input name="ssh_port" type="number" min="1" max="65535" value="{{ form.ssh_port or 22 }}"></label>
+    <label>Type
+      <select name="type">
+        {% for t in ["linux", "proxmox"] %}<option value="{{ t }}"{% if (form.type or "linux") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>Shutdown mode
+      <select name="shutdown_mode">
+        <option value="">automatic (graceful for Proxmox)</option>
+        {% for m in ["plain", "graceful-proxmox"] %}<option value="{{ m }}"{% if form.shutdown_mode == m %} selected{% endif %}>{{ m }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>MAC address (optional; the WoL check can discover it)
+      <input name="mac" value="{{ form.mac or '' }}" placeholder="aa:bb:cc:dd:ee:ff"></label>
+    <label>Broadcast address (optional)
+      <input name="broadcast" value="{{ form.broadcast or '' }}" placeholder="192.168.1.255"></label>
+    <label>Groups (comma separated) <input name="groups" value="{{ form.groups or '' }}"></label>
+    <label>Notes <textarea name="notes" rows="3" maxlength="2000">{{ form.notes or '' }}</textarea></label>
+    <label class="check"><input type="checkbox" name="allow_run_command" value="1"{% if form.allow_run_command == "1" %} checked{% endif %}> Allow run_command (MCP/API)</label>
+    <label class="check"><input type="checkbox" name="bios_verified" value="1"{% if form.bios_verified == "1" %} checked{% endif %}> Wake-on-LAN enabled in BIOS</label>
+    <label class="check"><input type="checkbox" name="is_self" value="1"{% if form.is_self == "1" %} checked{% endif %}> This machine runs or hosts Wakeboard</label>
+    <button type="submit" class="primary">{{ "Save" if editing else "Add device" }}</button>
+    <a class="btn" href="{{ '/devices/' ~ device.name|q if editing else '/' }}">Cancel</a>
+  </form>
+</section>
+{% endblock %}

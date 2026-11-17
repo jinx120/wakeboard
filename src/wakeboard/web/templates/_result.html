@@ -1,0 +1,20 @@
+<div class="result {{ 'ok' if ok else 'bad' }}">
+  <h2>{{ title }}</h2>
+  {% if message %}<p class="msg {{ 'ok' if ok else 'bad' }}">{{ message }}</p>{% endif %}
+  {% if confirm_url %}<p><a class="btn danger" href="{{ confirm_url }}">Review and confirm...</a></p>{% endif %}
+  {% if results %}
+  <ul class="results">
+    {% for name, r in results.items() %}
+    <li class="{{ 'ok' if r.ok else 'bad' }}">
+      <strong>{{ name }}</strong>: {{ "ok" if r.ok else "failed" }}
+      {% if r.error %}<span class="detail">{{ r.error }}</span>{% endif %}
+      {% if r.stages %}
+      <ul>
+        {% for s in r.stages %}<li class="{{ 'ok' if s.ok else 'bad' }}">{{ s.stage }}: {{ s.detail }}</li>{% endfor %}
+      </ul>
+      {% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% endif %}
+</div>

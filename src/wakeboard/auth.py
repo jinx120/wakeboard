@@ -58,6 +58,22 @@ class AuthStore:
             # rotate the session secret: all existing sessions become invalid
             self._set("auth.session_secret", secrets.token_hex(32))
 
+    def set_initial_password(self, pw: str) -> bool:
+        """Set the password only if none is set (first-run setup), atomically.
+        Returns False, changing nothing, when a password already exists."""
+        with self._lock:
+            if self._get("auth.password_hash") is not None:
+                return False
+            self._set("auth.password_hash", self._ph.hash(pw))
+            self._set("auth.session_secret", secrets.token_hex(32))
+            return True
+
+    def csrf_token(self, base: str) -> str:
+        """CSRF token bound to `base` (a session cookie or a pre-login nonce) under
+        the session secret, so it rotates whenever the password changes."""
+        return hmac.new(self._secret().encode(), b"wakeboard-csrf:" + base.encode(),
+                        hashlib.sha256).hexdigest()
+
     @staticmethod
     def _lock_key(ip: str) -> str:
         # fixed-length key regardless of input length

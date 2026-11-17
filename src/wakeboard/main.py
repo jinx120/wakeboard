@@ -20,6 +20,7 @@ from wakeboard.service import HostKeyAckRunner, LockedAudit, LockedRepo, Service
 from wakeboard.ssh import SshRunner
 from wakeboard.sshkeys import KeyStore
 from wakeboard.status import Poller, Prober
+from wakeboard.web.routes import mount_web
 
 log = logging.getLogger(__name__)
 
@@ -33,8 +34,10 @@ def mount_mcp(app: FastAPI, mcp_app) -> None:
 
 
 def mount_extras(app: FastAPI, service: Service, auth: AuthStore) -> None:
-    """Plug-in point for the MCP server (/mcp) and the web UI router (Task 11)."""
+    """Plug-in point for the MCP server (/mcp) and the web UI."""
     mount_mcp(app, build_mcp(service, auth))
+    mount_web(app, service, auth, keystore=app.state.keystore, runner=app.state.runner,
+              settings=app.state.settings)
 
 
 def create_app(settings: Settings | None = None, *, prober=None, poller: Poller | None = None,
