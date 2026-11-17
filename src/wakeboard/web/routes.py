@@ -20,7 +20,8 @@ from jinja2 import Environment, FileSystemLoader
 
 from wakeboard.api import client_ip
 from wakeboard.auth import SESSION_MAX_AGE, LockedOut
-from wakeboard.devices import VALID_SHUTDOWN_MODES, VALID_TYPES, Device, DuplicateDevice, UnknownDevice
+from wakeboard.devices import (NAME_RE, RESERVED_NAMES, VALID_SHUTDOWN_MODES, VALID_TYPES, Device,
+                               DuplicateDevice, UnknownDevice, valid_name)
 from wakeboard.service import (AuditUnavailable, ConfirmationRequired, InvalidRequest,
                                RunCommandDisabled, SelfTargetRefused)
 from wakeboard.ssh import ConnectFailed, EnrollmentFailed, HostKeyChanged
@@ -38,7 +39,7 @@ AUDIT_LIMIT = 200
 HISTORY_LIMIT = 50
 
 CSP = ("default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; "
-       "frame-ancestors 'none'")
+       "frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'")
 SECURITY_HEADERS = [
     (b"content-security-policy", CSP.encode()),
     (b"x-content-type-options", b"nosniff"),
@@ -46,13 +47,16 @@ SECURITY_HEADERS = [
 ]
 
 _HERE = Path(__file__).parent
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
-_RESERVED = {"all", "new"}
 DEVICE_ACTIONS = {"wake", "shutdown", "reboot", "wol-check", "wake-test", "enroll",
                   "ack-host-key", "delete", "edit"}
 BULK_ACTIONS = {"wake", "shutdown", "reboot"}
-CONFIRM_ACTIONS = {"shutdown", "reboot"}
+# actions that must be confirmed: bulk ones via the confirm page, device ones via hx-confirm
+# (HTMX) or, without JavaScript, the confirm page (a plain POST without confirm=1 is sent there)
+BULK_CONFIRM_ACTIONS = {"shutdown", "reboot"}
+DEVICE_CONFIRM_ACTIONS = {"shutdown", "reboot", "wake-test", "delete", "ack-host-key"}
+CONFIRM_VERBS = {"shutdown": "Shut down", "reboot": "Reboot", "wake-test": "Run the wake test on",
+                 "delete": "Remove", "ack-host-key": "Accept the new host key of"}
 
 
 # ---- plumbing --------------------------------------------------------------------
@@ -134,7 +138,7 @@ def _parse_device(form, existing: Device | None) -> Device:
         return str(form.get(k, default) or "").strip()
 
     name = f("name")
-    if not _NAME_RE.fullmatch(name) or name.lower() in _RESERVED:
+    if not valid_name(name):
         raise FormError("Invalid name: use 1-64 letters, digits, '.', '_' or '-' "
                         "(not 'all' or 'new').")
     host = f("host")
@@ -163,7 +167,7 @@ def _parse_device(form, existing: Device | None) -> Device:
         raise FormError("Invalid shutdown mode.")
     groups = [g.strip() for g in f("groups").split(",") if g.strip()]
     for g in groups:
-        if not _NAME_RE.fullmatch(g) or g.lower() in _RESERVED:
+        if not NAME_RE.fullmatch(g) or g.lower() in RESERVED_NAMES:
             raise FormError(f"Invalid group name {g!r}: use letters, digits, '.', '_' or '-'.")
     notes = str(form.get("notes", "") or "")
     if len(notes) > 2000:
@@ -235,7 +239,9 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
                 sent = (await request.form()).get("csrf")
             except Exception:
                 sent = None
-        if not expected or not isinstance(sent, str) or not hmac.compare_digest(sent, expected):
+        # compare as bytes: compare_digest raises TypeError on non-ASCII str (would be a 500)
+        if (not expected or not isinstance(sent, str)
+                or not hmac.compare_digest(sent.encode("utf-8", "replace"), expected.encode())):
             raise WebError(403, "Your form expired or the request was forged (bad CSRF token). "
                                 "Reload the page and try again.")
 
@@ -351,6 +357,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
 
     @r.post("/logout")
     async def logout(request: Request):
+        auth.revoke_session(request.cookies.get(SESSION_COOKIE))   # server-side: copies die too
         resp = RedirectResponse("/login", status_code=303)
         resp.delete_cookie(SESSION_COOKIE, path="/")
         return resp
@@ -374,18 +381,24 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
 
     @r.get("/confirm/{action}")
     async def confirm_page(request: Request, action: str, target: str = ""):
-        if action not in CONFIRM_ACTIONS:
+        if action not in DEVICE_CONFIRM_ACTIONS:
             raise WebError(404, "Not found.")
         try:
             members = resolve_targets(repo, target)
         except (UnknownTarget, NoDevices):
             raise WebError(404, "No such device or group.") from None
         bulk = is_bulk(target, repo)
+        if bulk and action not in BULK_CONFIRM_ACTIONS:
+            raise WebError(404, "Not found.")
         selfs = {d["name"] for d in await service.list_devices() if d["is_self"]}
         affected = [d.name for d in members if not (bulk and d.name in selfs)]
-        excluded = sorted(d.name for d in repo.list() if d.name in selfs) if bulk else []
+        # only devices the target names: a self device outside the group is not "excluded" from it
+        # ('all' already drops stored self devices in resolve_targets, so list them from the repo)
+        named = repo.list() if target.lower() == "all" else members
+        excluded = sorted(d.name for d in named if d.name in selfs) if bulk else []
         post_to = f"/bulk/{action}" if bulk else f"/devices/{_q(target)}/{action}"
-        return render(request, "confirm.html", action=action, target=target, bulk=bulk,
+        return render(request, "confirm.html", action=action, verb=CONFIRM_VERBS[action],
+                      target=target, bulk=bulk,
                       affected=affected, excluded=excluded, is_self=(not bulk and target in selfs),
                       post_to=post_to)
 
@@ -399,6 +412,8 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         if not target:
             raise WebError(400, "No target given.")
         title = f"{action} {target}"
+        if action in BULK_CONFIRM_ACTIONS and not confirm and not _is_hx(request):
+            return RedirectResponse(confirm_url(action, target), status_code=303)
         if action == "wake":
             coro = service.wake(target, caller=CALLER)
         elif action == "shutdown":
@@ -481,6 +496,9 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         d = get_device(name)
         form = await request.form()
         confirm = form.get("confirm") == "1"
+        if action in DEVICE_CONFIRM_ACTIONS and not confirm and not _is_hx(request):
+            # no JavaScript means no hx-confirm dialog ran: confirm on the server-rendered page
+            return RedirectResponse(confirm_url(action, d.name), status_code=303)
         if action == "wake":
             return await run_action(request, f"wake {d.name}", service.wake(d.name, caller=CALLER))
         if action == "shutdown":
@@ -574,26 +592,37 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
     async def settings_page(request: Request):
         return render(request, "settings.html", **settings_ctx())
 
+    def check_current(request: Request, form, err_key: str) -> HTMLResponse | None:
+        """Re-check the current password (under lockout); None when it is right."""
+        cur = form.get("current")
+        cur = cur if isinstance(cur, str) else ""
+        try:
+            ok = bool(cur) and auth.check_password(cur, client_ip(request))
+        except LockedOut as e:
+            return render(request, "settings.html", 429, headers={"Retry-After": str(e.retry_after)},
+                          **{err_key: f"Too many failed attempts. Try again in {e.retry_after} seconds."},
+                          **settings_ctx())
+        if not ok:
+            return render(request, "settings.html", 400,
+                          **{err_key: "Current password is incorrect."}, **settings_ctx())
+        return None
+
     @r.post("/settings")
     async def settings_post(request: Request):
         form = await request.form()
         op = form.get("op")
         if op == "rotate_token":
+            denied = check_current(request, form, "token_error")
+            if denied is not None:
+                return denied
             token = auth.rotate_token()
             _audit("rotate_token", "mcp", "ok")
             return render(request, "settings.html", new_token=token, **settings_ctx())
         if op == "password":
-            cur = str(form.get("current", "") or "")
             new, new2 = str(form.get("new", "") or ""), str(form.get("confirm", "") or "")
-            try:
-                ok = auth.check_password(cur, client_ip(request))
-            except LockedOut as e:
-                return render(request, "settings.html", 429, headers={"Retry-After": str(e.retry_after)},
-                              pw_error=f"Too many failed attempts. Try again in {e.retry_after} seconds.",
-                              **settings_ctx())
-            if not ok:
-                return render(request, "settings.html", 400, pw_error="Current password is incorrect.",
-                              **settings_ctx())
+            denied = check_current(request, form, "pw_error")
+            if denied is not None:
+                return denied
             if len(new) < MIN_PASSWORD:
                 return render(request, "settings.html", 400,
                               pw_error=f"New password must be at least {MIN_PASSWORD} characters.",

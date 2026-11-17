@@ -201,9 +201,14 @@ def test_logout_requires_csrf_and_clears_session(authed):
     c = authed["client"]
     assert c.post("/logout", data={}).status_code == 403
     assert c.get("/", follow_redirects=False).status_code == 200
+    stolen = c.cookies.get("wakeboard_session")
     r = post(authed, "/logout", follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/login"
     assert c.get("/", follow_redirects=False).status_code == 303
+    # a copied cookie is dead too: logout revokes the session server-side
+    c.cookies.set("wakeboard_session", stolen)
+    assert c.get("/", follow_redirects=False).status_code == 303
+    assert c.get("/settings", follow_redirects=False).status_code == 303
 
 
 # ---- CSRF / headers --------------------------------------------------------------
@@ -248,7 +253,7 @@ def test_security_headers_and_no_external_assets(authed):
         r = c.get(path)
         assert r.headers["content-security-policy"] == (
             "default-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; "
-            "frame-ancestors 'none'"), path
+            "frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'"), path
         assert r.headers["x-content-type-options"] == "nosniff"
         assert r.headers["referrer-policy"] == "no-referrer"
         if path.startswith("/static"):
@@ -321,7 +326,7 @@ def test_edit_and_delete_device(authed):
     r = post(authed, "/devices/pve2/edit", {"name": "pve1", "host": "x", "ssh_user": "root",
                                             "ssh_port": "22", "type": "linux"})
     assert r.status_code == 400 and "already exists" in r.text
-    r = post(authed, "/devices/pve2/delete", follow_redirects=False)
+    r = post(authed, "/devices/pve2/delete", {"confirm": "1"}, follow_redirects=False)
     assert r.status_code == 303 and r.headers["location"] == "/"
     assert authed["repo"].get("pve2") is None
 
@@ -376,7 +381,7 @@ def test_single_shutdown_calls_service_as_ui(authed):
 
 def test_self_device_goes_through_confirm_page(authed):
     c = authed["client"]
-    r = post(authed, "/devices/pi/shutdown")
+    r = post(authed, "/devices/pi/shutdown", headers={"HX-Request": "true"})
     assert r.status_code == 409 and "WARNING" in r.text and "/confirm/shutdown?target=pi" in r.text
     assert authed["actions"].calls == []
     page = c.get("/confirm/shutdown?target=pi")
@@ -394,9 +399,12 @@ def test_bulk_shutdown_requires_confirm_page(authed):
     assert page.status_code == 200
     assert "pve1" in page.text and "pve2" in page.text and "excluded" in page.text.lower()
     assert 'action="/bulk/shutdown"' in page.text and 'name="confirm" value="1"' in page.text
-    r = post(authed, "/bulk/shutdown", {"target": "all"})
+    r = post(authed, "/bulk/shutdown", {"target": "all"}, headers={"HX-Request": "true"})
     assert r.status_code == 409 and authed["actions"].calls == []
     assert "/confirm/shutdown?target=all" in r.text
+    r = post(authed, "/bulk/shutdown", {"target": "all"}, follow_redirects=False)   # no JS
+    assert r.status_code == 303 and r.headers["location"] == "/confirm/shutdown?target=all"
+    assert authed["actions"].calls == []
     r = post(authed, "/bulk/shutdown", {"target": "all", "confirm": "1"})
     assert r.status_code == 200
     assert sorted(n for _, n, _ in authed["actions"].calls) == ["pve1", "pve2"]
@@ -418,7 +426,7 @@ def test_service_errors_render_messages_not_500(authed):
     def boom(*a):
         raise RuntimeError("database is locked")
     authed["audit"].record = boom
-    r = post(authed, "/devices/pve1/shutdown")
+    r = post(authed, "/devices/pve1/shutdown", {"confirm": "1"})
     assert r.status_code == 503 and "audit" in r.text.lower() and "Traceback" not in r.text
     assert authed["actions"].calls == []
 
@@ -430,12 +438,12 @@ def test_service_errors_render_messages_not_500(authed):
 
 
 def test_wol_check_wake_test_and_ack(authed):
-    r = post(authed, "/devices/pve1/ack-host-key")
+    r = post(authed, "/devices/pve1/ack-host-key", {"confirm": "1"})
     assert r.status_code == 200 and authed["runner"].acked == ["pve1"]
     assert authed["repo"].get("pve1").host_key_ack is True
     r = post(authed, "/devices/pve1/wol-check")
     assert r.status_code == 200          # fake runner output: rendered, not a 500
-    r = post(authed, "/devices/pve1/wake-test")
+    r = post(authed, "/devices/pve1/wake-test", {"confirm": "1"})
     assert r.status_code == 200
 
 
@@ -463,7 +471,7 @@ def test_enroll_password_not_in_response_or_audit(authed, caplog):
 
 def test_token_shown_once_on_rotate(authed):
     c = authed["client"]
-    r = post(authed, "/settings", {"op": "rotate_token"})
+    r = post(authed, "/settings", {"op": "rotate_token", "current": PASSWORD})
     assert r.status_code == 200
     m = re.search(r'id="new-token"[^>]*>([A-Za-z0-9_\-]{20,})<', r.text)
     assert m, "token not shown"
@@ -518,3 +526,102 @@ def test_package_data_includes_templates_and_static():
     cfg = tomllib.loads((Path(__file__).parent.parent / "pyproject.toml").read_text())
     data = cfg["tool"]["setuptools"]["package-data"]["wakeboard"]
     assert any("templates" in p for p in data) and any("static" in p for p in data)
+
+
+# ---- review fix round ------------------------------------------------------------------
+
+def test_rotate_token_requires_current_password(authed):
+    for data in ({}, {"current": ""}, {"current": "wrong-password"}):
+        r = post(authed, "/settings", {"op": "rotate_token", **data})
+        assert r.status_code == 400, data
+        assert "password" in r.text.lower() and 'id="new-token"' not in r.text
+    assert not authed["auth"]._get("auth.token_hash")
+    page = authed["client"].get("/settings").text
+    form = page[page.index('value="rotate_token"'):]
+    form = form[:form.index("</form>")]
+    assert 'type="password"' in form and 'name="current"' in form
+    r = post(authed, "/settings", {"op": "rotate_token", "current": PASSWORD})
+    assert r.status_code == 200 and 'id="new-token"' in r.text
+
+
+def test_rotate_token_honours_lockout(authed):
+    for _ in range(5):
+        post(authed, "/settings", {"op": "rotate_token", "current": "nope-nope"})
+    r = post(authed, "/settings", {"op": "rotate_token", "current": PASSWORD})
+    assert r.status_code == 429 and r.headers.get("retry-after")
+    assert not authed["auth"]._get("auth.token_hash")
+
+
+@pytest.mark.parametrize("action", ["shutdown", "reboot", "wake-test", "delete", "ack-host-key"])
+def test_no_js_destructive_post_goes_to_confirm_page(authed, action):
+    c = authed["client"]
+    r = post(authed, f"/devices/pve1/{action}", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == f"/confirm/{action}?target=pve1"
+    assert authed["actions"].calls == [] and authed["runner"].acked == []
+    assert authed["repo"].get("pve1") is not None
+    page = c.get(r.headers["location"])
+    assert page.status_code == 200
+    assert f'action="/devices/pve1/{action}"' in page.text and 'name="confirm" value="1"' in page.text
+    r = post(authed, f"/devices/pve1/{action}", {"confirm": "1"}, follow_redirects=False)
+    assert r.status_code in (200, 303)
+    if action == "delete":
+        assert authed["repo"].get("pve1") is None
+    elif action == "ack-host-key":
+        assert authed["runner"].acked == ["pve1"]
+    else:
+        assert authed["actions"].calls or authed["runner"].calls
+
+
+def test_confirm_page_device_only_actions_reject_groups(authed):
+    c = authed["client"]
+    for action in ("wake-test", "delete", "ack-host-key"):
+        assert c.get(f"/confirm/{action}?target=lab").status_code == 404
+        assert c.get(f"/confirm/{action}?target=all").status_code == 404
+    assert c.get("/confirm/delete?target=nope").status_code == 404
+
+
+def test_bulk_no_js_reboot_goes_to_confirm_page(authed):
+    r = post(authed, "/bulk/reboot", {"target": "lab"}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/confirm/reboot?target=lab"
+    assert authed["actions"].calls == []
+
+
+def test_group_confirm_excludes_only_group_members(authed):
+    authed["repo"].add(Device(name="labhost", host="10.0.0.50", groups=["lab"], is_self=True))
+    page = authed["client"].get("/confirm/shutdown?target=lab").text
+    m = re.search(r"Excluded[^<:]*:([^<.]*)\.", page)
+    assert m, "no excluded list"
+    excluded = [x.strip() for x in m.group(1).split(",")]
+    assert excluded == ["labhost"]          # 'pi' is self but not in group lab
+    page = authed["client"].get("/confirm/shutdown?target=all").text
+    m = re.search(r"Excluded[^<:]*:([^<.]*)\.", page)
+    assert sorted(x.strip() for x in m.group(1).split(",")) == ["labhost", "pi"]
+
+
+def test_destructive_buttons_guard_double_submit(authed):
+    c = authed["client"]
+    for path in ("/", "/devices/pve1", "/confirm/shutdown?target=all", "/confirm/reboot?target=pi",
+                 "/confirm/delete?target=pve1"):
+        html = c.get(path).text
+        buttons = re.findall(r"<button[^>]*hx-confirm=[^>]*>", html)
+        assert buttons, path
+        for b in buttons:
+            assert 'hx-disabled-elt="this"' in b, (path, b)
+            assert 'hx-sync="this:drop"' in b, (path, b)
+
+
+def test_non_ascii_csrf_token_is_403_not_500(authed):
+    c = authed["client"]
+    r = c.post("/devices/pve1/wake", data={"csrf": "caf\u00e9-\u2603"})
+    assert r.status_code == 403
+    r = c.post("/devices/pve1/wake", headers={"X-CSRF-Token": "caf\u00e9".encode("latin-1")})
+    assert r.status_code == 403
+    assert authed["actions"].calls == []
+
+
+def test_device_name_rules_apply_to_any_entry_path(authed):
+    with pytest.raises(ValueError):
+        authed["repo"].add(Device(name="all", host="h"))
+    with pytest.raises(ValueError):
+        Device(name="a/b", host="h")
+    assert authed["repo"].get("all") is None

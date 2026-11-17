@@ -1,3 +1,4 @@
+import re
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -16,6 +17,16 @@ class UnknownDevice(Exception):
 
 
 VALID_SHUTDOWN_MODES = {"plain", "graceful-proxmox"}
+
+# Device names appear in URLs and target expressions: no '/', no whitespace, and never a
+# word that the UI or the target resolver gives a meaning of its own.
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+RESERVED_NAMES = {"all", "new"}
+
+
+def valid_name(name) -> bool:
+    return isinstance(name, str) and NAME_RE.fullmatch(name) is not None \
+        and name.lower() not in RESERVED_NAMES
 
 
 @dataclass
@@ -40,6 +51,9 @@ class Device:
     id: str | None = None
 
     def __post_init__(self):
+        if not valid_name(self.name):
+            raise ValueError(f"invalid device name: {str(self.name)[:80]!r} (use 1-64 letters, digits, "
+                             "'.', '_' or '-', starting with a letter or digit; not 'all' or 'new')")
         if self.type not in VALID_TYPES:
             raise ValueError(f"invalid device type: {self.type!r}")
         if self.mac is not None:

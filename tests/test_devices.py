@@ -93,3 +93,16 @@ def test_update_to_duplicate_name_raises_duplicate(conn):
     b.name = "a"
     with pytest.raises(DuplicateDevice):
         repo.update(b)
+
+
+@pytest.mark.parametrize("bad", ["all", "ALL", "new", "New", "a/b", "/x", "", " a", "a b", "-a",
+                                 ".hidden", "x" * 65, "café"])
+def test_device_name_rules_enforced_in_model(bad):
+    with pytest.raises(ValueError):
+        Device(name=bad, host="h")
+
+
+@pytest.mark.parametrize("good", ["a", "pve-1", "nas.lan", "box_2", "X" * 64, "allx", "newer"])
+def test_device_name_rules_accept_valid(good):
+    assert Device(name=good, host="h").name == good
+

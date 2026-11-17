@@ -71,7 +71,7 @@ class AuthStore:
     def csrf_token(self, base: str) -> str:
         """CSRF token bound to `base` (a session cookie or a pre-login nonce) under
         the session secret, so it rotates whenever the password changes."""
-        return hmac.new(self._secret().encode(), b"wakeboard-csrf:" + base.encode(),
+        return hmac.new(self._secret().encode(), b"wakeboard-csrf:" + base.encode("utf-8", "replace"),
                         hashlib.sha256).hexdigest()
 
     @staticmethod
@@ -168,14 +168,51 @@ class AuthStore:
     def new_session(self) -> str:
         return self._serializer().dumps({"s": secrets.token_hex(8)})
 
-    def valid_session(self, cookie: str | None) -> bool:
+    def _session_data(self, cookie: str | None):
+        """(session id, issued-at) for a valid signed cookie, else None. Ignores revocation."""
         if not cookie:
-            return False
+            return None
         try:
-            self._serializer().loads(cookie, max_age=SESSION_MAX_AGE)
-            return True
+            data, ts = self._serializer().loads(cookie, max_age=SESSION_MAX_AGE, return_timestamp=True)
         except Exception:
+            return None
+        sid = data.get("s") if isinstance(data, dict) else None
+        if not isinstance(sid, str) or not sid:
+            return None
+        return sid, ts.timestamp()
+
+    @staticmethod
+    def _revoked_key(sid: str) -> str:
+        return "auth.revoked." + hashlib.sha256(sid.encode()).hexdigest()[:32]
+
+    def valid_session(self, cookie: str | None) -> bool:
+        got = self._session_data(cookie)
+        if got is None:
             return False
+        return self._get(self._revoked_key(got[0])) is None
+
+    def revoke_session(self, cookie: str | None) -> None:
+        """Server-side logout: deny this session until it would have expired anyway.
+        Invalid or already-expired cookies are ignored. Expired deny rows are pruned."""
+        got = self._session_data(cookie)
+        with self._lock:
+            now = self.now()
+            rows = self.conn.execute(
+                "SELECT key, value FROM kv WHERE key LIKE 'auth.revoked.%'").fetchall()
+            stale = []
+            for r in rows:
+                try:
+                    dead = float(r["value"]) <= now
+                except (TypeError, ValueError):
+                    dead = True
+                if dead:
+                    stale.append((r["key"],))
+            if stale:
+                self.conn.executemany("DELETE FROM kv WHERE key=?", stale)
+                self.conn.commit()
+            if got is not None:
+                sid, issued = got
+                self._set(self._revoked_key(sid), str(issued + SESSION_MAX_AGE + 1))
 
     # -- bearer token
     @staticmethod

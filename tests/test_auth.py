@@ -160,3 +160,19 @@ def test_set_password_invalidates_sessions(store):
     store.set_password("newpass")
     assert store.valid_session(c) is False
     assert store.valid_session(store.new_session()) is True
+
+
+def test_revoke_session_is_server_side(conn, store, clock):
+    a, b = store.new_session(), store.new_session()
+    store.revoke_session(a)
+    assert store.valid_session(a) is False
+    assert store.valid_session(b) is True
+    # the denylist is persistent (not per-instance) and tolerates junk
+    assert AuthStore(conn, now=clock).valid_session(a) is False
+    store.revoke_session("garbage")
+    store.revoke_session(None)
+    # denylist rows are pruned once the session would have expired anyway
+    clock.t += 7 * 86400 + 5
+    store.revoke_session(store.new_session())
+    rows = conn.execute("SELECT key FROM kv WHERE key LIKE 'auth.revoked.%'").fetchall()
+    assert len(rows) == 1
