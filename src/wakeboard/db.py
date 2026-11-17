@@ -34,6 +34,10 @@ MIGRATIONS: list[str] = [
         value TEXT
     );
     """,
+    """
+    ALTER TABLE devices ADD COLUMN wake_test_result TEXT;
+    ALTER TABLE devices ADD COLUMN wake_test_at REAL;
+    """,
 ]
 
 
