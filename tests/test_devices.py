@@ -1,6 +1,6 @@
 import pytest
 
-from wakeboard.devices import Device, DeviceRepo, DuplicateDevice
+from wakeboard.devices import Device, DeviceRepo, DuplicateDevice, UnknownDevice
 
 
 def test_add_get_roundtrip(conn):
@@ -60,3 +60,36 @@ def test_host_key_ack_roundtrip(conn):
     assert repo.get("a").host_key_ack is True
     assert repo.add(Device(name="b", host="h", host_key_ack=True)).host_key_ack is True
     assert repo.get("b").host_key_ack is True
+
+
+def test_group_with_comma_rejected():
+    with pytest.raises(ValueError):
+        Device(name="a", host="h", groups=["a,b"])
+
+
+def test_groups_stripped_and_empties_dropped():
+    assert Device(name="a", host="h", groups=[" lab ", "", "  "]).groups == ["lab"]
+
+
+def test_invalid_shutdown_mode_rejected():
+    with pytest.raises(ValueError):
+        Device(name="a", host="h", shutdown_mode="nuke")
+
+
+def test_remove_missing_raises(conn):
+    with pytest.raises(UnknownDevice):
+        DeviceRepo(conn).remove("ghost")
+
+
+def test_update_missing_raises(conn):
+    with pytest.raises(UnknownDevice):
+        DeviceRepo(conn).update(Device(name="ghost", host="h", id="nope"))
+
+
+def test_update_to_duplicate_name_raises_duplicate(conn):
+    repo = DeviceRepo(conn)
+    repo.add(Device(name="a", host="h"))
+    b = repo.add(Device(name="b", host="h"))
+    b.name = "a"
+    with pytest.raises(DuplicateDevice):
+        repo.update(b)

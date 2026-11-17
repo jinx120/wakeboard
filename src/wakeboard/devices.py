@@ -9,6 +9,13 @@ class DuplicateDevice(Exception):
     pass
 
 
+class UnknownDevice(Exception):
+    pass
+
+
+VALID_SHUTDOWN_MODES = {"plain", "graceful-proxmox"}
+
+
 @dataclass
 class Device:
     name: str
@@ -33,6 +40,12 @@ class Device:
             raise ValueError(f"invalid device type: {self.type!r}")
         if self.shutdown_mode is None:
             self.shutdown_mode = "graceful-proxmox" if self.type == "proxmox" else "plain"
+        if self.shutdown_mode not in VALID_SHUTDOWN_MODES:
+            raise ValueError(f"invalid shutdown_mode: {self.shutdown_mode!r}")
+        groups = [g.strip() for g in self.groups]
+        if any("," in g for g in groups):
+            raise ValueError("group names must not contain commas")
+        self.groups = [g for g in groups if g]
 
 
 _COLS = ["name", "host", "ssh_user", "ssh_port", "mac", "broadcast", "type", "groups",
@@ -78,14 +91,20 @@ class DeviceRepo:
     def update(self, d: Device) -> None:
         sets = ", ".join(f"{c} = ?" for c in _COLS)
         try:
-            self.conn.execute(f"UPDATE devices SET {sets} WHERE id = ?", [*_values(d), d.id])
+            cur = self.conn.execute(f"UPDATE devices SET {sets} WHERE id = ?", [*_values(d), d.id])
         except sqlite3.IntegrityError as e:
             self.conn.rollback()
             raise DuplicateDevice(d.name) from e
+        if cur.rowcount == 0:
+            self.conn.rollback()
+            raise UnknownDevice(d.name)
         self.conn.commit()
 
     def remove(self, name: str) -> None:
-        self.conn.execute("DELETE FROM devices WHERE name = ?", (name,))
+        cur = self.conn.execute("DELETE FROM devices WHERE name = ?", (name,))
+        if cur.rowcount == 0:
+            self.conn.rollback()
+            raise UnknownDevice(name)
         self.conn.commit()
 
     def list(self) -> list[Device]:

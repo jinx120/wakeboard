@@ -30,6 +30,7 @@ def resolve_targets(repo: DeviceRepo, target: str) -> list[Device]:
 
 
 def is_bulk(target: str, repo: DeviceRepo) -> bool:
+    """False for unknown targets; callers must still resolve_targets, which raises."""
     if repo.get(target) is not None:
         return False
     if target.lower() == "all":
