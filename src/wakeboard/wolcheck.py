@@ -121,7 +121,7 @@ async def wol_check(runner, device: Device) -> WolReport:
                          f"run: ethtool -s {nic} wol g")
 
     ident = [re.escape(nic)] + ([re.escape(rep.mac)] if rep.mac else [])
-    pattern = "|".join(["wol", "wake-on", *ident])
+    pattern = "|".join(["wol", "wake-on", "wakeonlan", *ident])
     g = await runner.run(
         device, _priv(device, f"grep -rIsiE {shlex.quote(pattern)} {_PERSIST_PATHS}"))
     if g.exit == 0:
@@ -145,7 +145,7 @@ def _persists(grep_out: str, ident: list[str]) -> bool:
     ident_re = re.compile("|".join(ident), re.I)
     for line in grep_out.splitlines():
         path, _, text = line.partition(":")
-        if re.search(r"wol|wake-on", text, re.I):
+        if re.search(r"wol|wake-on|wakeonlan", text, re.I):
             wol.add(path)
         if ident_re.search(text) or ident_re.search(path):
             nic.add(path)
