@@ -1,0 +1,208 @@
+import asyncio
+import stat
+
+import pytest
+
+from conftest import Canned
+from wakeboard.devices import Device
+from wakeboard.ssh import HostKeyChanged, RunResult, SshRunner
+from wakeboard.sshkeys import KeyStore
+
+PASSWORD = "s3cret-Enroll-Pw!"
+
+
+def _mode(p):
+    return stat.S_IMODE(p.stat().st_mode)
+
+
+@pytest.fixture
+def keystore(tmp_path):
+    ks = KeyStore(tmp_path / "data")
+    ks.ensure_global()
+    return ks
+
+
+@pytest.fixture
+def known_hosts(tmp_path):
+    return tmp_path / "data" / "known_hosts"
+
+
+@pytest.fixture
+def runner(keystore, known_hosts):
+    return SshRunner(keystore, known_hosts)
+
+
+@pytest.fixture
+def device(ssh_server):
+    return Device(name="box", host=ssh_server.host, ssh_port=ssh_server.port, ssh_user="root")
+
+
+@pytest.fixture
+def authorized(ssh_server, keystore):
+    ssh_server.authorized_keys.add(keystore.public_key())
+    return ssh_server
+
+
+def test_global_key_created_0600_and_idempotent(tmp_path):
+    ks = KeyStore(tmp_path / "data")
+    ks.ensure_global()
+    p = ks.private_path(None)
+    assert p.exists()
+    assert _mode(p) == 0o600
+    assert _mode(p.parent) == 0o700
+    first = p.read_bytes()
+    pub = ks.public_key()
+    assert pub.startswith("ssh-ed25519 ")
+    ks.ensure_global()
+    assert p.read_bytes() == first
+    assert ks.public_key() == pub
+
+
+def test_private_path_rejects_traversal(keystore):
+    with pytest.raises(ValueError):
+        keystore.private_path("../evil")
+
+
+def test_authorize_command_contains_pubkey(keystore):
+    cmd = keystore.authorize_command()
+    pub = keystore.public_key()
+    assert pub in cmd
+    assert "mkdir -p ~/.ssh" in cmd
+    assert "chmod 700 ~/.ssh" in cmd
+    assert ">> ~/.ssh/authorized_keys" in cmd
+    assert "chmod 600 ~/.ssh/authorized_keys" in cmd
+
+
+async def test_run_returns_stdout_exit(runner, device, authorized):
+    authorized.responses["uptime"] = Canned("up 3 days\n", "warn\n", 3)
+    r = await runner.run(device, "uptime")
+    assert r == RunResult(stdout="up 3 days\n", stderr="warn\n", exit=3)
+    assert authorized.commands == ["uptime"]
+    assert ("publickey", "root") in authorized.auth_log
+
+
+async def test_first_connect_pins_host_key(runner, device, authorized, known_hosts):
+    assert not known_hosts.exists()
+    authorized.responses["true"] = Canned()
+    await runner.run(device, "true")
+    text = known_hosts.read_text()
+    assert f"[{device.host}]:{device.ssh_port}" in text
+    assert authorized.host_key_line.split()[1] in text
+    assert _mode(known_hosts) == 0o600
+    # second connect matches the pin and does not duplicate it
+    await runner.run(device, "true")
+    assert known_hosts.read_text() == text
+
+
+async def test_changed_host_key_raises(runner, device, authorized, known_hosts):
+    authorized.responses["true"] = Canned()
+    await runner.run(device, "true")
+    pinned = known_hosts.read_text()
+    authorized.swap_host_key()
+    with pytest.raises(HostKeyChanged):
+        await runner.run(device, "true")
+    # hard error: the command never ran and the pin was not replaced
+    assert authorized.commands == ["true"]
+    assert known_hosts.read_text() == pinned
+
+
+async def test_changed_host_key_accepted_when_device_acked(runner, device, authorized, known_hosts):
+    authorized.responses["true"] = Canned()
+    await runner.run(device, "true")
+    authorized.swap_host_key()
+    device.host_key_ack = True
+    await runner.run(device, "true")
+    assert authorized.host_key_line.split()[1] in known_hosts.read_text()
+
+
+async def test_acknowledge_then_repins(runner, device, authorized, known_hosts):
+    authorized.responses["true"] = Canned()
+    await runner.run(device, "true")
+    old = authorized.host_key_line.split()[1]
+    authorized.swap_host_key()
+    with pytest.raises(HostKeyChanged):
+        await runner.run(device, "true")
+    runner.acknowledge_host_key(device)
+    assert old not in (known_hosts.read_text() if known_hosts.exists() else "")
+    await runner.run(device, "true")
+    text = known_hosts.read_text()
+    assert authorized.host_key_line.split()[1] in text
+    assert old not in text
+
+
+async def test_acknowledge_leaves_other_hosts_pinned(runner, device, authorized, known_hosts):
+    authorized.responses["true"] = Canned()
+    await runner.run(device, "true")
+    known_hosts.write_text(known_hosts.read_text() + "[10.0.0.9]:22 ssh-ed25519 AAAAother\n")
+    runner.acknowledge_host_key(device)
+    text = known_hosts.read_text()
+    assert "[10.0.0.9]:22" in text
+    assert f"[{device.host}]:{device.ssh_port}" not in text
+
+
+async def test_enroll_with_password_installs_key_then_key_login_works(
+        runner, device, ssh_server, keystore, tmp_path):
+    ssh_server.password = PASSWORD
+    await runner.enroll_with_password(device, PASSWORD)
+    assert ("password", "root") in ssh_server.auth_log
+    ak = ssh_server.home / ".ssh" / "authorized_keys"
+    assert keystore.public_key() in ak.read_text().splitlines()
+    # password login no longer needed
+    ssh_server.password = None
+    ssh_server.responses["hostname"] = Canned("box\n")
+    r = await runner.run(device, "hostname")
+    assert r.stdout == "box\n"
+    assert ("publickey", "root") in ssh_server.auth_log
+    # password never persisted anywhere under the data dir, nor kept on the runner
+    for f in (tmp_path / "data").rglob("*"):
+        if f.is_file():
+            assert PASSWORD.encode() not in f.read_bytes()
+    assert PASSWORD not in repr(vars(runner))
+
+
+async def test_enroll_twice_does_not_duplicate_key(runner, device, ssh_server, keystore, caplog):
+    caplog.set_level("DEBUG")
+    ssh_server.password = PASSWORD
+    await runner.enroll_with_password(device, PASSWORD)
+    await runner.enroll_with_password(device, PASSWORD)
+    lines = (ssh_server.home / ".ssh" / "authorized_keys").read_text().splitlines()
+    assert lines.count(keystore.public_key()) == 1
+    assert PASSWORD not in caplog.text
+
+
+async def test_enroll_wrong_password_error_hides_password(runner, device, ssh_server, caplog):
+    caplog.set_level("DEBUG")
+    ssh_server.password = "the-right-one"
+    with pytest.raises(Exception) as ei:
+        await runner.enroll_with_password(device, PASSWORD)
+    assert PASSWORD not in str(ei.value)
+    assert PASSWORD not in repr(ei.value)
+    assert PASSWORD not in caplog.text
+
+
+async def test_non_utf8_output_decoded_with_replacement(runner, device, authorized):
+    authorized.responses["dump"] = Canned(b"ok \xff\xfe end\n", b"\xc3\x28", 0)
+    r = await runner.run(device, "dump")
+    assert r.stdout == "ok �� end\n"
+    assert "�" in r.stderr
+    assert r.exit == 0
+
+
+async def test_run_timeout(runner, device, authorized):
+    authorized.responses["slow"] = Canned(delay=5)
+    with pytest.raises(asyncio.TimeoutError):
+        await runner.run(device, "slow", timeout=0.5)
+
+
+async def test_sudo_ok_false_when_prompt_required(runner, ssh_server, keystore):
+    ssh_server.authorized_keys.add(keystore.public_key())
+    dev = Device(name="u", host=ssh_server.host, ssh_port=ssh_server.port, ssh_user="alice")
+    ssh_server.responses["sudo -n true"] = Canned("", "sudo: a password is required\n", 1)
+    assert await runner.sudo_ok(dev) is False
+    ssh_server.responses["sudo -n true"] = Canned("", "", 0)
+    assert await runner.sudo_ok(dev) is True
+
+
+async def test_sudo_ok_true_for_root_without_running_sudo(runner, device, authorized):
+    assert await runner.sudo_ok(device) is True
+    assert "sudo -n true" not in authorized.commands
