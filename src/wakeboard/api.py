@@ -4,6 +4,7 @@ from typing import Literal
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, StrictBool
 
+from wakeboard.devices import VALID_SHUTDOWN_MODES
 from wakeboard.service import (ConfirmationRequired, InvalidRequest, RunCommandDisabled,
                                Service)
 from wakeboard.targets import NoDevices, UnknownTarget
@@ -28,8 +29,11 @@ class RebootBody(TargetBody):
     confirm: StrictBool = False
 
 
+ShutdownMode = Literal[tuple(sorted(VALID_SHUTDOWN_MODES))]  # single source of truth
+
+
 class ShutdownBody(RebootBody):
-    mode: Literal["plain", "graceful-proxmox"] | None = None
+    mode: ShutdownMode | None = None
 
 
 class RunCommandBody(TargetBody):

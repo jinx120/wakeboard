@@ -154,3 +154,52 @@ def test_create_app_env_password_only_applied_when_unset(tmp_path, monkeypatch):
     monkeypatch.setenv("WAKEBOARD_PASSWORD", "second-password")
     app = main.create_app(Settings(data_dir=tmp_path))
     assert app.state.auth.check_password("first-password", "127.0.0.1")
+
+
+def test_docs_and_openapi_disabled(tmp_path):
+    from wakeboard import main
+    app = main.create_app(Settings(data_dir=tmp_path))
+    c = TestClient(app)
+    for path in ("/docs", "/redoc", "/openapi.json"):
+        assert c.get(path).status_code == 404
+
+
+def test_api_mode_literal_matches_device_modes():
+    import typing
+    from wakeboard.api import ShutdownBody
+    from wakeboard.devices import VALID_SHUTDOWN_MODES
+    ann = ShutdownBody.model_fields["mode"].annotation
+    lit = next(a for a in typing.get_args(ann) if a is not type(None))
+    assert set(typing.get_args(lit)) == VALID_SHUTDOWN_MODES
+
+
+def test_auth_store_uses_injected_lock(conn):
+    import threading
+
+    class Spy:
+        def __init__(self):
+            self.inner, self.n = threading.RLock(), 0
+
+        def __enter__(self):
+            self.n += 1
+            return self.inner.__enter__()
+
+        def __exit__(self, *a):
+            return self.inner.__exit__(*a)
+    spy = Spy()
+    store = AuthStore(conn, lock=spy)
+    store.rotate_token()
+    assert spy.n == 1
+    store.new_session()          # first session-secret write
+    assert spy.n == 2
+    store.new_session()          # secret exists: no write, no lock
+    assert spy.n == 2
+    store.set_password("pw-long-enough")
+    assert spy.n == 3
+    assert isinstance(AuthStore(conn)._lock, type(threading.Lock()))
+
+
+def test_create_app_shares_db_lock_with_auth(tmp_path):
+    from wakeboard import main
+    app = main.create_app(Settings(data_dir=tmp_path))
+    assert app.state.auth._lock is app.state.service.lock is app.state.repo.lock

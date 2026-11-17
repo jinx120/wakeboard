@@ -23,11 +23,13 @@ class LockedOut(Exception):
 
 
 class AuthStore:
-    def __init__(self, conn: sqlite3.Connection, now=time.time):
+    def __init__(self, conn: sqlite3.Connection, now=time.time, lock=None):
         self.conn = conn
         self.now = now
         self._ph = PasswordHasher()
-        self._lock = threading.Lock()
+        # Pass the app's shared DB write lock so kv writes never interleave with
+        # other writers on the same connection; must not be held when calling in.
+        self._lock = lock if lock is not None else threading.Lock()
 
     # -- kv helpers
     def _get(self, key: str) -> str | None:
@@ -129,8 +131,11 @@ class AuthStore:
     def _secret(self) -> str:
         s = self._get("auth.session_secret")
         if s is None:
-            s = secrets.token_hex(32)
-            self._set("auth.session_secret", s)
+            with self._lock:
+                s = self._get("auth.session_secret")
+                if s is None:
+                    s = secrets.token_hex(32)
+                    self._set("auth.session_secret", s)
         return s
 
     def _serializer(self) -> URLSafeTimedSerializer:
@@ -163,7 +168,8 @@ class AuthStore:
 
     def rotate_token(self) -> str:
         token = secrets.token_urlsafe(32)
-        self._set("auth.token_hash", self._hash(token))
+        with self._lock:
+            self._set("auth.token_hash", self._hash(token))
         return token
 
     def check_token(self, token: str | None) -> bool:

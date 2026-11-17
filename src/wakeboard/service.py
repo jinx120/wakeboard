@@ -6,8 +6,11 @@ gating), audits every action and refusal, and turns SSH/connect errors into
 per-device failed results instead of exceptions.
 """
 import asyncio
+import contextlib
+import hashlib
 import ipaddress
 import logging
+import re
 import socket
 import threading
 import time
@@ -16,7 +19,8 @@ from typing import Callable, Iterable
 
 from wakeboard.actions import ActionResult, StageResult
 from wakeboard.devices import VALID_SHUTDOWN_MODES, Device
-from wakeboard.ssh import ConnectFailed, HostKeyChanged
+from wakeboard.actions import LOCKED
+from wakeboard.ssh import ConnectFailed, HostKeyChanged, SudoRequired
 from wakeboard.status import InfoCache, collect_info as _collect_info
 from wakeboard.targets import NoDevices, UnknownTarget, is_bulk, resolve_targets
 from wakeboard.wolcheck import adopt_mac, wake_test as _wake_test, wol_check as _wol_check
@@ -28,6 +32,10 @@ MAX_CMD = 4096
 RUN_COMMAND_TIMEOUT = 120
 SELF_CACHE_TTL = 60.0
 _AUDIT_MAX = 500
+_AUDIT_CMD = 120
+
+# Failures that are part of normal operation: logged at WARNING, no traceback.
+EXPECTED_ERRORS = (ConnectFailed, HostKeyChanged, SudoRequired)
 
 
 class ConfirmationRequired(Exception):
@@ -167,8 +175,35 @@ def detect_self(devices: Iterable[Device], local_ips: Callable[[], Iterable[str]
 
 # ---- result helpers ----------------------------------------------------------------
 
+def _log_failure(what: str, name: str, e: BaseException) -> None:
+    if isinstance(e, EXPECTED_ERRORS):
+        log.warning("%s on %s failed: %s", what, name, _err(e))
+    else:
+        log.error("%s on %s failed unexpectedly", what, name, exc_info=e)
+
+
+_REDACT = [
+    (re.compile(r"(?i)(authorization:\s*)((?:bearer|basic|token)\s+)?\S+"), r"\1\2***"),
+    (re.compile(r"(?i)(--?(?:password|passwd|token|secret|api[_-]?key)\s+)(?!-)\S+"), r"\1***"),
+    (re.compile(r"(?i)\b(password|passwd|pwd|token|secret|api[_-]?key)(\s*[=:]\s*)\S+"), r"\1\2***"),
+    (re.compile(r"(?<!\S)-p(?=\S)[^\s'\"]+"), "-p***"),
+]
+
+
+def redact_cmd(cmd: str) -> str:
+    """Audit form of a command: obvious secrets masked, cut to 120 chars plus
+    '…(+N chars, sha256:<8 hex>)' (hash of the redacted text, so it leaks nothing)."""
+    out = cmd or ""
+    for rx, sub in _REDACT:
+        out = rx.sub(sub, out)
+    if len(out) > _AUDIT_CMD:
+        digest = hashlib.sha256(out.encode()).hexdigest()[:8]
+        out = f"{out[:_AUDIT_CMD]}…(+{len(out) - _AUDIT_CMD} chars, sha256:{digest})"
+    return out
+
+
 def _err(e: BaseException) -> str:
-    if isinstance(e, (ConnectFailed, HostKeyChanged)) and str(e):
+    if isinstance(e, EXPECTED_ERRORS) and str(e):
         return str(e)[:_AUDIT_MAX]
     return (f"{type(e).__name__}: {e}" if str(e) else type(e).__name__)[:_AUDIT_MAX]
 
@@ -250,6 +285,12 @@ class Service:
         except Exception:
             log.exception("audit write failed (%s %s %s)", caller, target, action)
 
+    def _audit_attempt(self, caller, target, action, confirm, devices) -> None:
+        # Written BEFORE the action: if it takes Wakeboard's own host down, the
+        # intent is still on record even though no result row will follow.
+        self._audit(caller, target, action,
+                    f"attempt: confirm={confirm} targets={','.join(d.name for d in devices)}")
+
     def _resolve_target(self, target: str, caller: str, action: str) -> list[Device]:
         try:
             return resolve_targets(self.repo, target)
@@ -305,8 +346,7 @@ class Service:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                if not isinstance(e, (ConnectFailed, HostKeyChanged)):
-                    log.exception("%s on %s failed", action, d.name)
+                _log_failure(action, d.name, e)
                 out = _fail_dict(_err(e))
             self._audit(caller, d.name, action, _summary(out))
             return out
@@ -345,7 +385,10 @@ class Service:
         async def one(d: Device) -> dict:
             try:
                 up = bool(await self.prober.is_up(d))
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
+                _log_failure("probe", d.name, e)
                 return {"status": "unreachable", "up": None, "info": None, "error": _err(e)}
             self.state[d.name] = up
             if not up:
@@ -357,6 +400,7 @@ class Service:
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
+                    _log_failure("collect_info", d.name, e)
                     return {"status": "unreachable", "up": True, "info": None, "error": _err(e)}
                 self.info_cache.put(d.name, info)
             return {"status": "up", "up": True, "info": asdict(info), "error": None}
@@ -383,18 +427,22 @@ class Service:
 
     async def shutdown(self, target: str, caller: str, mode: str | None = None,
                        confirm: bool = False) -> dict:
+        confirm = confirm is True  # JSON-ish "false", "0", 1 are NOT confirmation
         if mode is not None and mode not in VALID_SHUTDOWN_MODES:
             self._audit(caller, target, "shutdown", f"refused: invalid mode {mode!r}")
             raise InvalidRequest(f"invalid shutdown mode: {mode!r}")
         devices = await self._targets(target, caller, "shutdown", destructive=True, confirm=confirm)
         label = f"shutdown {mode}" if mode else "shutdown"
+        self._audit_attempt(caller, target, label, confirm, devices)
 
         async def fn(d: Device) -> dict:
             return _result_dict(await self.actions.shutdown(d, mode=mode))
         return await self._run_each(devices, caller, label, fn)
 
     async def reboot(self, target: str, caller: str, confirm: bool = False) -> dict:
+        confirm = confirm is True  # JSON-ish "false", "0", 1 are NOT confirmation
         devices = await self._targets(target, caller, "reboot", destructive=True, confirm=confirm)
+        self._audit_attempt(caller, target, "reboot", confirm, devices)
 
         async def fn(d: Device) -> dict:
             return _result_dict(await self.actions.reboot(d))
@@ -406,10 +454,15 @@ class Service:
         async def fn(d: Device) -> dict:
             try:
                 rep = await self._wol_check(self.runner, d)
-            except (ConnectFailed, HostKeyChanged, OSError, asyncio.TimeoutError) as e:
-                return {"ok": False, "status": "unreachable", "report": None, "ready": False,
-                        "mac_adopted": False, "stages": [], "error": _err(e)}
-            adopted = adopt_mac(self.repo, d, rep)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _log_failure("wake_check", d.name, e)
+                reach = isinstance(e, (ConnectFailed, HostKeyChanged, OSError, asyncio.TimeoutError))
+                return {"ok": False, "status": "unreachable" if reach else "error", "report": None,
+                        "ready": False, "mac_adopted": False, "stages": [], "error": _err(e)}
+            with self.lock:  # re-read + set only mac, atomically w.r.t. other writers
+                adopted = adopt_mac(self.repo, d, rep)
             ready = bool(rep.supported and "g" in rep.current_flags and rep.persistent)
             notes = "; ".join(rep.notes)
             detail = ("ready" if ready else "not ready") + (f" ({notes})" if notes else "")
@@ -438,20 +491,34 @@ class Service:
 
     async def run_command(self, target: str, cmd: str, caller: str) -> dict:
         d = self._single(target, caller, "run_command")
-        shown = (cmd or "")[:200]
+        shown = redact_cmd(cmd)
+        selfs = await self._self_names(self.repo.list())
+        if d.name in selfs:
+            self._audit(caller, d.name, "run_command", f"refused: self device: {shown}")
+            raise RunCommandDisabled(
+                f"run_command is refused on '{d.name}': it is the machine Wakeboard runs on "
+                f"(or hosts it)")
         if not d.allow_run_command:
             self._audit(caller, d.name, "run_command", f"refused: run_command disabled: {shown}")
             raise RunCommandDisabled(f"run_command is disabled for '{d.name}'")
         if not cmd or not cmd.strip() or len(cmd) > MAX_CMD:
             self._audit(caller, d.name, "run_command", "refused: invalid command")
             raise InvalidRequest(f"cmd must be 1..{MAX_CMD} characters")
+        # Share Actions' per-device lock so a command never races a power action.
+        get_lock = getattr(self.actions, "_lock", None)
+        lock = get_lock(d) if callable(get_lock) else None
+        if lock is not None and lock.locked():
+            out = {"ok": False, "stdout": "", "stderr": "", "exit": None, "truncated": False,
+                   "error": LOCKED}
+            self._audit(caller, d.name, "run_command", f"fail: {LOCKED} | {shown}")
+            return out
         try:
-            r = await self.runner.run(d, cmd, timeout=RUN_COMMAND_TIMEOUT)
+            async with (lock if lock is not None else contextlib.nullcontext()):
+                r = await self.runner.run(d, cmd, timeout=RUN_COMMAND_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            if not isinstance(e, (ConnectFailed, HostKeyChanged)):
-                log.exception("run_command on %s failed", d.name)
+            _log_failure("run_command", d.name, e)
             out = {"ok": False, "stdout": "", "stderr": "", "exit": None, "truncated": False,
                    "error": _err(e)}
             self._audit(caller, d.name, "run_command", f"fail: {out['error']} | {shown}")

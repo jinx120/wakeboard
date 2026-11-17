@@ -156,11 +156,19 @@ def _persists(grep_out: str, ident: list[str]) -> bool:
 
 
 def adopt_mac(repo, device: Device, report: WolReport) -> bool:
-    """Save a discovered MAC onto the device, only if it has none. True if saved."""
+    """Save a discovered MAC onto the device, only if it has none. True if saved.
+
+    Re-reads the stored device and changes only its mac, so edits made since
+    `device` was loaded are kept. Callers sharing a connection should hold their
+    write lock around this call (Service does)."""
     if device.mac or not report.mac:
         return False
-    device.mac = normalize_mac(report.mac)
-    repo.update(device)
+    fresh = repo.get(device.name)
+    if fresh is None or fresh.mac:
+        return False
+    fresh.mac = normalize_mac(report.mac)
+    repo.update(fresh)
+    device.mac = fresh.mac
     return True
 
 

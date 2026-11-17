@@ -274,11 +274,12 @@ async def test_every_action_audited_with_caller(svc, repo, audit, monkeypatch):
         await svc.reboot("all", caller="mcp")
     rows = list(reversed(audit.list()))
     assert [r["action"].split()[0] for r in rows] == [
-        "wake", "shutdown", "reboot", "wake_check", "run_command", "reboot"]
+        "wake", "shutdown", "shutdown", "reboot", "reboot", "wake_check", "run_command", "reboot"]
+    assert rows[1]["result"].startswith("attempt") and rows[3]["result"].startswith("attempt")
     assert all(r["caller"] == "mcp" for r in rows)
     assert rows[0]["target"] == "pve1" and rows[0]["result"].startswith("ok")
     assert rows[-1]["target"] == "all" and "refused" in rows[-1]["result"]
-    assert "uptime" in rows[4]["action"] + rows[4]["result"]
+    assert "uptime" in rows[6]["action"] + rows[6]["result"]
 
 
 async def test_failed_action_audited_as_fail(svc, actions, audit):
@@ -414,3 +415,143 @@ async def test_detected_self_never_persisted_via_wake_check(repo, audit, actions
     assert res["hv"]["mac_adopted"] is True
     saved = repo.get("hv")
     assert saved.mac == "aa:bb:cc:dd:ee:50" and saved.is_self is False
+
+
+# ---- review fixes -----------------------------------------------------------------
+
+import asyncio as _asyncio
+import threading as _threading
+
+from wakeboard.actions import Actions as _RealActions
+from wakeboard.config import Settings as _Settings
+from wakeboard.service import redact_cmd
+from wakeboard.ssh import AuthFailed
+
+
+@pytest.mark.parametrize("bad", ["false", "0", 1, "true", "yes"])
+async def test_confirm_must_be_exactly_true(svc, actions, bad):
+    with pytest.raises(ConfirmationRequired):
+        await svc.shutdown("all", caller="mcp", confirm=bad)
+    with pytest.raises(SelfTargetRefused):
+        await svc.reboot("pi", caller="mcp", confirm=bad)
+    with pytest.raises(ConfirmationRequired):
+        await svc.reboot("lab", caller="mcp", confirm=bad)
+    assert actions.calls == []
+
+
+async def test_attempt_row_written_before_destructive_action(svc, actions, audit):
+    await svc.shutdown("pve1", caller="ui")
+    rows = list(reversed(audit.list()))
+    assert rows[0]["result"] == "attempt: confirm=False targets=pve1"
+    assert rows[1]["result"].startswith("ok")
+    await svc.reboot("lab", caller="api", confirm=True)
+    att = [r for r in audit.list() if r["action"] == "reboot" and r["result"].startswith("attempt")]
+    assert att[0]["result"] == "attempt: confirm=True targets=pve1,pve2" and att[0]["target"] == "lab"
+
+
+async def test_attempt_row_survives_process_dying_mid_action(svc, actions, audit):
+    actions.raise_for["pi"] = _asyncio.CancelledError()
+    with pytest.raises(_asyncio.CancelledError):
+        await svc.shutdown("pi", caller="ui", confirm=True)
+    rows = audit.list()
+    assert any(r["target"] == "pi" and r["result"] == "attempt: confirm=True targets=pi" for r in rows)
+
+
+async def test_adopt_mac_keeps_concurrent_edits(repo, audit, actions, runner):
+    repo.add(Device(name="nomac", host="10.0.0.3"))
+
+    async def wol(r, d):
+        fresh = repo.get("nomac")         # someone edits the device mid-check
+        fresh.allow_run_command = True
+        fresh.notes = "edited"
+        repo.update(fresh)
+        return WolReport(nic="eno1", mac="aa:bb:cc:dd:ee:03", supported=True, current_flags="g",
+                         persistent=True, notes=[])
+    svc = make_service(repo, audit, actions, runner)
+    svc._wol_check = wol
+    res = await svc.wake_check("nomac", caller="ui")
+    assert res["nomac"]["mac_adopted"] is True
+    saved = repo.get("nomac")
+    assert saved.mac == "aa:bb:cc:dd:ee:03"
+    assert saved.allow_run_command is True and saved.notes == "edited"
+
+
+def test_redact_cmd():
+    assert redact_cmd("uptime") == "uptime"
+    out = redact_cmd("mysql -psecret -u root --password=hunter2 x token=abc PASSWORD: zz")
+    for secret in ("secret", "hunter2", "abc", "zz"):
+        assert secret not in out
+    assert "-p***" in out and "--password=***" in out and "token=***" in out
+    out = redact_cmd("curl -H 'Authorization: Bearer abc.def' http://x")
+    assert "abc.def" not in out and "Authorization: Bearer ***" in out
+    out = redact_cmd("ssh -p 22 host")  # not a glued -p<word>
+    assert out == "ssh -p 22 host"
+    long = "echo " + "a" * 300
+    out = redact_cmd(long)
+    assert out.startswith(long[:120]) and len(out) < 200
+    assert f"…(+{len(long) - 120} chars, sha256:" in out
+
+
+async def test_run_command_audit_is_redacted(svc, repo, audit):
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    await svc.run_command("pve1", "mysql -psecret -e 'select 1'", caller="api")
+    row = audit.list()[0]
+    assert "secret" not in row["result"] + row["action"] and "-p***" in row["result"]
+
+
+@pytest.mark.parametrize("exc", [AuthFailed("authentication to root@10.0.0.1:22 failed"),
+                                 SudoRequired("sudo needs a password"),
+                                 HostKeyChanged("host key changed"),
+                                 RuntimeError("weird")])
+async def test_wake_check_failure_shape_is_uniform(repo, audit, actions, runner, exc, caplog):
+    async def wol(r, d):
+        raise exc
+    svc = make_service(repo, audit, actions, runner)
+    svc._wol_check = wol
+    res = (await svc.wake_check("pve1", caller="ui"))["pve1"]
+    assert set(res) == {"ok", "status", "report", "ready", "mac_adopted", "stages", "error"}
+    assert res["ok"] is False and res["status"] in ("unreachable", "error") and str(exc) in res["error"]
+    expected = not isinstance(exc, RuntimeError)
+    recs = [r for r in caplog.records if r.name == "wakeboard.service"]
+    assert recs and all((r.exc_info is None) == expected for r in recs)
+    assert all(r.levelname == ("WARNING" if expected else "ERROR") for r in recs)
+
+
+async def test_expected_action_errors_logged_without_traceback(svc, actions, caplog):
+    actions.raise_for["pve1"] = ConnectFailed("connect timed out")
+    await svc.reboot("pve1", caller="ui")
+    recs = [r for r in caplog.records if r.name == "wakeboard.service"]
+    assert recs and all(r.levelname == "WARNING" and r.exc_info is None for r in recs)
+
+
+async def test_run_command_refuses_self(repo, audit, actions, runner):
+    repo.add(Device(name="hv", host="192.168.1.50", allow_run_command=True))
+    pi = repo.get("pi")
+    pi.allow_run_command = True
+    repo.update(pi)
+    svc = make_service(repo, audit, actions, runner, local=("192.168.1.50",))
+    for name in ("pi", "hv"):
+        with pytest.raises(RunCommandDisabled) as ei:
+            await svc.run_command(name, "uptime", caller="mcp")
+        assert "Wakeboard runs on" in str(ei.value)
+        assert "refused" in audit.list()[0]["result"]
+    assert runner.calls == []
+
+
+async def test_run_command_takes_the_actions_device_lock(repo, audit, runner, tmp_path):
+    real = _RealActions(runner, FakeProber(), _Settings(data_dir=tmp_path))
+    d = repo.get("pve1")
+    d.allow_run_command = True
+    repo.update(d)
+    svc = make_service(repo, audit, real, runner)
+    lock = real._lock(repo.get("pve1"))
+    await lock.acquire()
+    try:
+        res = await svc.run_command("pve1", "uptime", caller="api")
+    finally:
+        lock.release()
+    assert res["ok"] is False and "in progress" in res["error"] and runner.calls == []
+    res = await svc.run_command("pve1", "uptime", caller="api")
+    assert res["ok"] is True and not lock.locked()

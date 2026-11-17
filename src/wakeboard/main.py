@@ -35,8 +35,7 @@ def create_app(settings: Settings | None = None, *, prober=None, poller: Poller 
     # One lock serializes every write on the shared connection (repo, audit, auth),
     # so one thread's rollback can never discard another's uncommitted write.
     db_lock = threading.RLock()
-    auth = AuthStore(conn)
-    auth._lock = db_lock  # share the write lock (RLock: auth methods nest _set under it)
+    auth = AuthStore(conn, lock=db_lock)
     pw = os.environ.get("WAKEBOARD_PASSWORD")
     if pw and not auth.password_set():
         auth.set_password(pw)
@@ -63,7 +62,9 @@ def create_app(settings: Settings | None = None, *, prober=None, poller: Poller 
             with contextlib.suppress(asyncio.CancelledError):
                 await task
 
-    app = FastAPI(title="Wakeboard", lifespan=lifespan)
+    # No docs/OpenAPI routes: /healthz is the only unauthenticated endpoint.
+    app = FastAPI(title="Wakeboard", lifespan=lifespan,
+                  docs_url=None, redoc_url=None, openapi_url=None)
     app.state.settings = settings
     app.state.service = service
     app.state.auth = auth
