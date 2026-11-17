@@ -22,6 +22,18 @@ class SudoRequired(Exception):
     pass
 
 
+class ConnectFailed(Exception):
+    """The SSH connection or session could not be set up, so the command was never sent.
+
+    Raised by SshRunner.run for connect-phase errors (timeout, refused, no route,
+    handshake failure, session open failure). HostKeyChanged is still raised as itself.
+    """
+
+
+class AuthFailed(ConnectFailed):
+    """Key authentication was rejected (permanent, retrying will not help)."""
+
+
 class EnrollmentFailed(Exception):
     pass
 
@@ -150,13 +162,30 @@ class SshRunner:
                 "password": None, "kbdint_auth": False, "preferred_auth": "publickey"}
 
     async def run(self, device: Device, cmd: str, timeout: float = 30) -> RunResult:
-        async def _go() -> RunResult:
-            conn, _ = await self._connect(device, **self._key_auth(device))
-            async with conn:
-                r = await conn.run(cmd, check=False, encoding=None)
-            return RunResult(stdout=_decode(r.stdout), stderr=_decode(r.stderr),
-                             exit=r.exit_status if r.exit_status is not None else -1)
-        return await asyncio.wait_for(_go(), timeout)
+        """Run cmd. Connect-phase failures raise ConnectFailed (command never sent);
+        errors after the session is open (e.g. ConnectionLost, TimeoutError) propagate as is."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        auth = self._key_auth(device)
+        where = f"{device.ssh_user}@{device.host}:{device.ssh_port}"
+        try:
+            conn, _ = await asyncio.wait_for(self._connect(device, **auth), timeout)
+        except HostKeyChanged:
+            raise
+        except asyncio.TimeoutError:
+            raise ConnectFailed(f"connect to {where} timed out after {timeout:g}s") from None
+        except asyncssh.PermissionDenied as e:
+            raise AuthFailed(f"authentication to {where} failed: {e}") from e
+        except (OSError, asyncssh.Error) as e:
+            raise ConnectFailed(f"connect to {where} failed: {type(e).__name__}: {e}") from e
+        async with conn:
+            remaining = max(deadline - loop.time(), 0.001)
+            try:
+                r = await asyncio.wait_for(conn.run(cmd, check=False, encoding=None), remaining)
+            except asyncssh.ChannelOpenError as e:
+                raise ConnectFailed(f"opening session on {where} failed: {e}") from e
+        return RunResult(stdout=_decode(r.stdout), stderr=_decode(r.stderr),
+                         exit=r.exit_status if r.exit_status is not None else -1)
 
     async def enroll_with_password(self, device: Device, password: str, timeout: float = 30) -> None:
         """Connect once with the password and install the public key (idempotent).

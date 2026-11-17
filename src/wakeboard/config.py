@@ -9,6 +9,7 @@ class Settings:
     poll_interval: int = 30
     wake_timeout: int = 300
     guest_timeout: int = 120
+    shutdown_timeout: int = 300
 
     @classmethod
     def from_env(cls) -> "Settings":

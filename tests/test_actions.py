@@ -14,7 +14,7 @@ from wakeboard.actions import (ActionResult, Actions, StageResult, parse_pct_lis
                                parse_qm_list)
 from wakeboard.config import Settings
 from wakeboard.devices import Device
-from wakeboard.ssh import HostKeyChanged, RunResult, SudoRequired
+from wakeboard.ssh import AuthFailed, ConnectFailed, HostKeyChanged, RunResult, SudoRequired
 from wakeboard.wol import send_magic
 
 QM_LIST = """\
@@ -84,7 +84,7 @@ def clock():
 
 @pytest.fixture
 def cfg(tmp_path):
-    return Settings(data_dir=tmp_path, wake_timeout=300, guest_timeout=120)
+    return Settings(data_dir=tmp_path, wake_timeout=300, guest_timeout=120, shutdown_timeout=200)
 
 
 def mk(runner, prober, cfg, clock, **kw):
@@ -102,7 +102,8 @@ def pve(**kw):
 class ProxmoxSim:
     """Stateful fake Proxmox host: guests stop when told; host goes down on shutdown."""
 
-    def __init__(self, qm_running, pct_running, ignore_shutdown=(), host_up=True):
+    def __init__(self, qm_running, pct_running, ignore_shutdown=(), host_up=True, unstoppable=()):
+        self.unstoppable = set(unstoppable)
         self.qm = set(qm_running)
         self.pct = set(pct_running)
         self.ignore = set(ignore_shutdown)
@@ -116,10 +117,12 @@ class ProxmoxSim:
             return ok(self._qm_text())
         if parts == ["pct", "list"]:
             return ok(self._pct_text())
-        if len(parts) == 3 and parts[0] in ("qm", "pct") and parts[1] in ("shutdown", "stop"):
+        if (len(parts) == 5 and parts[0] in ("qm", "pct")
+                and (parts[1], parts[3], parts[4]) in {("shutdown", "--timeout", "120"),
+                                                       ("stop", "--overrule-shutdown", "1")}):
             gid = int(parts[2])
             pool = self.qm if parts[0] == "qm" else self.pct
-            if parts[1] == "stop" or gid not in self.ignore:
+            if gid not in self.unstoppable and (parts[1] == "stop" or gid not in self.ignore):
                 pool.discard(gid)
             return ok()
         if parts == ["shutdown", "-h", "now"]:
@@ -294,7 +297,7 @@ async def test_shutdown_reports_failure_if_host_still_up_after_timeout(cfg, cloc
     res = await a.shutdown(linux())
     assert res.ok is False
     assert res.stages[-1].stage == "down" and res.stages[-1].ok is False
-    assert clock.t >= cfg.wake_timeout
+    assert cfg.shutdown_timeout <= clock.t < cfg.wake_timeout  # uses shutdown_timeout
 
 
 async def test_shutdown_connection_drop_is_expected(cfg, clock):
@@ -443,7 +446,8 @@ async def test_graceful_stops_guests_then_shutdown_in_order(cfg, clock):
     assert res.ok is True, res
     assert runner.cmds == [
         "qm list", "pct list",
-        "qm shutdown 100", "qm shutdown 102", "pct shutdown 105",
+        "qm shutdown 100 --timeout 120", "qm shutdown 102 --timeout 120",
+        "pct shutdown 105 --timeout 120",
         "qm list", "pct list",            # wait: all stopped
         "shutdown -h now",
     ]
@@ -468,12 +472,12 @@ async def test_graceful_force_stops_guest_after_timeout(cfg, clock):
     res = await a.shutdown(pve())
     assert res.ok is True, res
     stops = [c for c in runner.cmds if " stop " in c]
-    assert stops == ["qm stop 102"]
-    # forced only after waiting the full guest timeout, and before host shutdown
-    i_stop = runner.cmds.index("qm stop 102")
-    assert runner.cmds.index("shutdown -h now") > i_stop
-    assert runner.cmds[:5] == ["qm list", "pct list", "qm shutdown 100", "qm shutdown 102",
-                               "pct shutdown 105"]
+    assert stops == ["qm stop 102 --overrule-shutdown 1"]
+    # forced only after waiting the full guest timeout, then re-verified, then host shutdown
+    i_stop = runner.cmds.index("qm stop 102 --overrule-shutdown 1")
+    assert runner.cmds[i_stop + 1:] == ["qm list", "pct list", "shutdown -h now"]
+    assert runner.cmds[:5] == ["qm list", "pct list", "qm shutdown 100 --timeout 120",
+                               "qm shutdown 102 --timeout 120", "pct shutdown 105 --timeout 120"]
     assert clock.t >= cfg.guest_timeout
     assert "force_stop" in [s.stage for s in res.stages]
 
@@ -482,7 +486,7 @@ async def test_graceful_force_stop_failure_aborts_host_shutdown(cfg, clock):
     sim = ProxmoxSim({100}, set(), ignore_shutdown={100})
 
     def handler(cmd):
-        if cmd == "qm stop 100":
+        if cmd == "qm stop 100 --overrule-shutdown 1":
             return RunResult("", "can't lock file '/var/lock/qemu-server/lock-100.conf'", 255)
         return sim.handler(cmd)
 
@@ -508,7 +512,7 @@ async def test_graceful_guest_shutdown_timeout_is_not_fatal(cfg, clock):
     sim = ProxmoxSim({100}, set())
 
     def handler(cmd):
-        if cmd == "qm shutdown 100":
+        if cmd == "qm shutdown 100 --timeout 120":
             sim.qm.discard(100)
             return asyncio.TimeoutError()
         return sim.handler(cmd)
@@ -517,7 +521,7 @@ async def test_graceful_guest_shutdown_timeout_is_not_fatal(cfg, clock):
     a = mk(runner, FakeProber(lambda: sim.host_up), cfg, clock)
     res = await a.shutdown(pve())
     assert res.ok is True, res
-    assert "qm stop 100" not in runner.cmds
+    assert not any(" stop " in c for c in runner.cmds)
 
 
 async def test_plain_mode_override_on_proxmox_skips_guests(cfg, clock):
@@ -588,6 +592,7 @@ async def test_concurrent_action_rejected_by_lock(cfg):
     async def sleep(s):
         await gate.wait()
         state["up"] = False
+        t["v"] += s
 
     class Prober:
         async def is_up(self, device):
@@ -625,3 +630,196 @@ async def test_progress_callback_errors_do_not_abort(cfg, clock):
 
     a = mk(FakeRunner(handler), FakeProber(lambda: state["up"]), cfg, clock)
     assert (await a.shutdown(linux(), progress=bad)).ok is True
+
+
+# ---- review fixes: sustained down, connect-phase errors, deadlines -----------
+
+async def test_ping_blip_after_shutdown_is_not_down(cfg, clock):
+    """One lost probe right after `shutdown -h now` must not be read as 'down'."""
+    probes = iter([True, False])  # precheck up, then a single blip, then up forever
+
+    a = mk(FakeRunner(), FakeProber(lambda: next(probes, True)), cfg, clock)
+    res = await a.shutdown(linux())
+    assert res.ok is False
+    assert res.stages[-1] == StageResult("down", False, res.stages[-1].detail)
+    assert "still up" in res.stages[-1].detail
+
+
+async def test_down_needs_sustained_streak_reset_by_up(cfg, clock):
+    # down, down, up, then down for good: confirmation only after a fresh streak >= 10s
+    seq = iter([True, False, False, True])
+    a = mk(FakeRunner(), FakeProber(lambda: next(seq, False)), cfg, clock)
+    res = await a.shutdown(linux())
+    assert res.ok is True
+    # the fresh streak starts at the 4th probe after precheck (t=6) and needs >= 10s
+    assert clock.t >= 16
+
+
+async def test_down_confirmed_only_after_three_probes_and_ten_seconds(cfg, clock):
+    calls = []
+
+    def up():
+        calls.append(clock.t)
+        return len(calls) == 1  # up for precheck, down afterwards
+
+    a = mk(FakeRunner(), FakeProber(up), cfg, clock)
+    res = await a.shutdown(linux())
+    assert res.ok is True
+    down_probes = calls[1:]
+    assert len(down_probes) >= 3
+    assert down_probes[-1] - down_probes[0] >= 10
+
+
+async def test_prober_exception_never_confirms_down(cfg, clock):
+    n = {"i": 0}
+
+    class Raising:
+        async def is_up(self, device):
+            n["i"] += 1
+            if n["i"] == 1:
+                return True  # precheck
+            raise RuntimeError("probe broke")
+
+    a = mk(FakeRunner(), Raising(), cfg, clock)
+    res = await a.shutdown(linux())
+    assert res.ok is False
+    assert res.stages[-1].stage == "down" and not res.stages[-1].ok
+
+
+async def test_prober_exception_resets_down_streak(cfg, clock):
+    seq = iter([True, False, False, "boom", False, False])  # then up forever
+
+    class P:
+        async def is_up(self, device):
+            v = next(seq, True)
+            if v == "boom":
+                raise RuntimeError("probe broke")
+            return v
+
+    a = mk(FakeRunner(), P(), cfg, clock)
+    res = await a.shutdown(linux())
+    assert res.ok is False
+
+
+async def test_precheck_probe_exception_is_not_already_down(cfg, clock):
+    class Raising:
+        async def is_up(self, device):
+            raise RuntimeError("probe broke")
+
+    runner = FakeRunner()
+    res = await mk(runner, Raising(), cfg, clock).shutdown(linux())
+    assert res.ok is False
+    assert res.stages[0].stage == "precheck" and res.stages[0].detail != "already down"
+    assert runner.cmds == []
+
+
+async def test_reboot_blip_is_not_a_reboot(cfg, clock):
+    probes = iter([True, False])  # one blip, never really went down
+    a = mk(FakeRunner(), FakeProber(lambda: next(probes, True)), cfg, clock)
+    res = await a.reboot(linux())
+    assert res.ok is False
+    assert [(s.stage, s.ok) for s in res.stages][-1] == ("down", False)
+
+
+async def test_shutdown_unreachable_host_fails_stage(cfg, clock):
+    runner = FakeRunner(lambda cmd: ConnectFailed("connect to root@10.0.0.5:22 timed out after 30s"))
+    res = await mk(runner, FakeProber(True), cfg, clock).shutdown(linux())
+    assert res.ok is False
+    assert res.stages[-1].stage == "shutdown" and not res.stages[-1].ok
+    assert "timed out" in res.stages[-1].detail
+    assert "down" not in [s.stage for s in res.stages]
+
+
+async def test_shutdown_auth_failed_fails_stage(cfg, clock):
+    runner = FakeRunner(lambda cmd: AuthFailed("authentication failed"))
+    res = await mk(runner, FakeProber(True), cfg, clock).shutdown(linux())
+    assert res.ok is False and res.stages[-1].stage == "shutdown"
+
+
+async def test_reboot_unreachable_host_fails_stage(cfg, clock):
+    runner = FakeRunner(lambda cmd: ConnectFailed("connect failed: no route to host"))
+    res = await mk(runner, FakeProber(True), cfg, clock).reboot(linux())
+    assert res.ok is False
+    assert res.stages[-1].stage == "reboot" and not res.stages[-1].ok
+
+
+async def test_wake_ssh_connect_failed_is_retried(cfg, clock):
+    n = {"i": 0}
+
+    def handler(cmd):
+        n["i"] += 1
+        return ConnectFailed("refused") if n["i"] < 3 else ok()
+
+    a = mk(FakeRunner(handler), FakeProber(True), cfg, clock, wol=lambda *a, **k: None)
+    assert (await a.wake(linux())).ok
+    assert n["i"] == 3
+
+
+async def test_wake_ssh_auth_failed_not_retried(cfg, clock):
+    runner = FakeRunner(lambda cmd: AuthFailed("denied"))
+    a = mk(runner, FakeProber(True), cfg, clock, wol=lambda *a, **k: None)
+    res = await a.wake(linux())
+    assert res.ok is False and len(runner.cmds) == 1
+
+
+async def test_wake_total_time_bounded_by_one_deadline(cfg, clock):
+    # host answers ping at t=250, ssh never comes up: total must stay within wake_timeout
+    a = mk(FakeRunner(lambda cmd: ConnectFailed("refused")), FakeProber(lambda: clock.t >= 250),
+           cfg, clock, wol=lambda *a, **k: None)
+    res = await a.wake(pve())
+    assert res.ok is False
+    assert [(s.stage, s.ok) for s in res.stages] == [
+        ("magic_packet", True), ("ping", True), ("ssh", False)]
+    assert clock.t <= cfg.wake_timeout
+
+
+async def test_graceful_guest_still_running_after_force_stop_aborts(cfg, clock):
+    sim = ProxmoxSim({100}, set(), unstoppable={100})
+    runner = FakeRunner(sim.handler)
+    res = await mk(runner, FakeProber(lambda: sim.host_up), cfg, clock).shutdown(pve())
+    assert res.ok is False
+    assert res.stages[-1].stage == "verify_stopped" and not res.stages[-1].ok
+    assert "qm stop 100 --overrule-shutdown 1" in runner.cmds
+    assert runner.cmds[-2:] == ["qm list", "pct list"]
+    assert "shutdown -h now" not in runner.cmds
+
+
+async def test_graceful_relist_failure_after_force_stop_aborts(cfg, clock):
+    sim = ProxmoxSim({100}, set(), ignore_shutdown={100})
+    forced = {"v": False}
+
+    def handler(cmd):
+        if cmd.startswith("qm stop"):
+            forced["v"] = True
+        if forced["v"] and cmd == "qm list":
+            return RunResult("", "ipcc_send_rec failed", 2)
+        return sim.handler(cmd)
+
+    runner = FakeRunner(handler)
+    res = await mk(runner, FakeProber(lambda: sim.host_up), cfg, clock).shutdown(pve())
+    assert res.ok is False and res.stages[-1].stage == "verify_stopped"
+    assert "shutdown -h now" not in runner.cmds
+
+
+async def test_guest_shutdown_error_leaves_no_task_running(cfg, clock):
+    finished = []
+    sim = ProxmoxSim({100, 102}, set())
+
+    class Runner:
+        cmds = []
+
+        async def run(self, device, cmd, timeout=30):
+            self.cmds.append(cmd)
+            if cmd.startswith("sudo -n qm shutdown 100"):
+                return RunResult("", "sudo: a password is required\n", 1)
+            if cmd.startswith("sudo -n qm shutdown 102"):
+                for _ in range(20):
+                    await asyncio.sleep(0)
+                finished.append(102)
+                return ok()
+            return sim.handler(cmd)
+
+    a = mk(Runner(), FakeProber(True), cfg, clock)
+    with pytest.raises(SudoRequired):
+        await a.shutdown(pve(ssh_user="ops"))
+    assert finished == [102]  # sibling ran to completion before the error surfaced

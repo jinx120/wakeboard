@@ -5,7 +5,8 @@ import pytest
 
 from conftest import Canned
 from wakeboard.devices import Device
-from wakeboard.ssh import EnrollmentFailed, HostKeyChanged, RunResult, SshRunner
+from wakeboard.ssh import (AuthFailed, ConnectFailed, EnrollmentFailed, HostKeyChanged, RunResult,
+                           SshRunner)
 from wakeboard.sshkeys import KeyStore
 
 PASSWORD = "s3cret-Enroll-Pw!"
@@ -249,3 +250,36 @@ async def test_host_with_whitespace_rejected(runner, bad, known_hosts):
     with pytest.raises(ValueError):
         runner.acknowledge_host_key(dev)
     assert not known_hosts.exists()
+
+
+async def test_run_connection_refused_raises_connect_failed(runner, keystore):
+    import socket
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()  # nothing listens here now
+    dev = Device(name="gone", host="127.0.0.1", ssh_port=port)
+    with pytest.raises(ConnectFailed) as ei:
+        await runner.run(dev, "shutdown -h now")
+    assert not isinstance(ei.value, AuthFailed)
+
+
+async def test_run_connect_timeout_raises_connect_failed(runner, keystore):
+    async def silent(reader, writer):
+        await asyncio.sleep(5)  # accept TCP but never speak SSH
+
+    srv = await asyncio.start_server(silent, "127.0.0.1", 0)
+    port = srv.sockets[0].getsockname()[1]
+    try:
+        with pytest.raises(ConnectFailed, match="timed out"):
+            await runner.run(Device(name="mute", host="127.0.0.1", ssh_port=port), "true",
+                             timeout=0.5)
+    finally:
+        srv.close()
+
+
+async def test_run_auth_rejected_raises_auth_failed(runner, device, ssh_server):
+    # key not in authorized_keys
+    with pytest.raises(AuthFailed):
+        await runner.run(device, "true")
+    assert ssh_server.commands == []
