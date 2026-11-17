@@ -5,7 +5,7 @@ from wakeboard.devices import Device, DeviceRepo, DuplicateDevice, UnknownDevice
 
 def test_add_get_roundtrip(conn):
     repo = DeviceRepo(conn)
-    d = repo.add(Device(name="nas", host="10.0.0.2", mac="aa:bb", groups=["Lab", "x"],
+    d = repo.add(Device(name="nas", host="10.0.0.2", mac="aa:bb:cc:dd:ee:ff", groups=["Lab", "x"],
                         allow_run_command=True, bios_verified=True, notes="hi"))
     assert d.id is not None
     got = repo.get("nas")

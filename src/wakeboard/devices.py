@@ -2,6 +2,8 @@ import sqlite3
 import uuid
 from dataclasses import dataclass, field
 
+from wakeboard.wol import normalize_mac
+
 VALID_TYPES = {"proxmox", "linux"}
 
 
@@ -38,6 +40,8 @@ class Device:
     def __post_init__(self):
         if self.type not in VALID_TYPES:
             raise ValueError(f"invalid device type: {self.type!r}")
+        if self.mac is not None:
+            self.mac = normalize_mac(self.mac)
         if self.shutdown_mode is None:
             self.shutdown_mode = "graceful-proxmox" if self.type == "proxmox" else "plain"
         if self.shutdown_mode not in VALID_SHUTDOWN_MODES:
