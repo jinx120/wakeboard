@@ -20,6 +20,11 @@ see `src/wakeboard/web/static/VENDORED.txt`. The UI loads nothing from external 
 
 <img width="852" height="243" alt="image" src="https://github.com/user-attachments/assets/089c2e1f-1ee1-4626-b67b-052bd4654f39" />
 
+<img width="750" height="340" alt="image" src="https://github.com/user-attachments/assets/005de4a8-3520-4e54-8450-4849b88ff371" />
+
+<img width="374" height="853" alt="image" src="https://github.com/user-attachments/assets/f1b1abc6-7aaa-46f3-9724-430231ab0245" />
+
+
 ## Install on a Raspberry Pi 3B
 
 1. Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager. In the Imager
