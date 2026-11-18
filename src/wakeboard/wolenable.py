@@ -72,7 +72,7 @@ def build_script(preset: str, nic: str, mac: str | None, conn: str | None = None
                   _live(nic)]
     else:
         raise ValueError(f"not a Linux preset: {preset}")
-    return "; ".join(p.rstrip("; ") if i else p.rstrip() for i, p in enumerate(parts))
+    return "; ".join(p.strip().rstrip(";").strip() for p in parts)
 
 
 def _ps(script: str) -> str:

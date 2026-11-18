@@ -220,3 +220,13 @@ async def test_connection_name_is_quoted():
 def test_presets_whitelist_shape():
     assert PRESETS["auto"] and {"systemd-unit", "networkmanager", "systemd-networkd",
                                 "ifupdown", "windows"} <= set(PRESETS)
+
+
+@pytest.mark.parametrize("preset", ["systemd-unit", "networkmanager", "systemd-networkd", "ifupdown"])
+def test_generated_scripts_are_valid_posix_sh(preset):
+    """Regression: a stray ';;' once made the systemd-unit script a sh syntax error."""
+    import subprocess
+    script = build_script(preset, "nic0", "aa:bb:cc:dd:ee:ff", conn="Wired connection 1")
+    assert ";;" not in script and "; ;" not in script
+    r = subprocess.run(["sh", "-n", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
