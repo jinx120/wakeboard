@@ -106,3 +106,29 @@ def test_device_name_rules_enforced_in_model(bad):
 def test_device_name_rules_accept_valid(good):
     assert Device(name=good, host="h").name == good
 
+
+
+def test_valid_types_and_ordering():
+    from wakeboard.devices import TYPE_ORDER, VALID_TYPES
+    assert VALID_TYPES == {"proxmox", "linux", "debian", "ubuntu", "arch", "fedora", "windows"}
+    assert set(TYPE_ORDER) == VALID_TYPES and TYPE_ORDER[0] == "linux"
+
+
+def test_new_types_accepted_and_default_plain():
+    for t in ("debian", "ubuntu", "arch", "fedora", "windows"):
+        d = Device(name="x", host="h", type=t)
+        assert d.shutdown_mode == "plain" and d.wol_method == "auto"
+    with pytest.raises(ValueError):
+        Device(name="x", host="h", type="macos")
+
+
+def test_wol_method_validated_and_persisted(tmp_path):
+    from wakeboard.db import connect
+    from wakeboard.devices import DeviceRepo
+    with pytest.raises(ValueError):
+        Device(name="x", host="h", wol_method="bogus")
+    repo = DeviceRepo(connect(tmp_path / "w.db"))
+    repo.add(Device(name="x", host="h", type="windows", wol_method="windows"))
+    assert repo.get("x").wol_method == "windows"
+    d = repo.get("x"); d.wol_method = "ifupdown"; repo.update(d)
+    assert repo.get("x").wol_method == "ifupdown"

@@ -44,7 +44,9 @@
     <dt>Type</dt><dd>{{ d.type }} ({{ d.shutdown_mode }})</dd>
     <dt>MAC</dt><dd>{{ d.mac or "not set" }}{% if d.broadcast %} via {{ d.broadcast }}{% endif %}</dd>
     <dt>Groups</dt><dd>{{ d.groups|join(", ") or "-" }}</dd>
-    {% if info %}
+    {% if info and info.hostname %}
+    <dt>Hostname</dt><dd>{{ info.hostname }}</dd>
+    {% elif info %}
     <dt>Uptime</dt><dd>{{ info.uptime_s|uptime }}</dd>
     <dt>Load</dt><dd>{{ info.load1 }}</dd>
     <dt>Memory</dt><dd>{{ info.mem_used_pct }}%</dd>
@@ -101,7 +103,7 @@
   <form method="post" action="{{ p }}/enable-wol">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label>Method
-      <select name="preset">{% for key, label in wol_presets.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+      <select name="preset">{% for key, label in wol_presets.items() %}<option value="{{ key }}"{% if d.wol_method == key %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
     <button type="submit" class="danger" hx-post="{{ p }}/enable-wol" hx-target="#result"
             hx-disabled-elt="this" hx-sync="this:drop"
             hx-confirm="Enable Wake-on-LAN (persistent) on {{ d.name }}? This changes its network configuration over SSH.">Enable WoL (persistent)</button>

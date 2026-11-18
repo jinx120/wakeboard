@@ -208,3 +208,14 @@ async def test_dash_host_never_reaches_subprocess(monkeypatch):
         d = Device(name="x", host=h)
         assert not await Prober(tcp=_false).is_up(d)
     assert called == []
+
+
+async def test_windows_info_is_minimal_and_skips_posix_script():
+    r = FakeRunner(RunResult("WINBOX\r\n", "", 0))
+    i = await collect_info(r, dev(type="windows"))
+    assert r.cmds == ["hostname"] and i.hostname == "WINBOX" and i.uptime_s is None
+
+
+async def test_windows_info_failure_raises():
+    with pytest.raises(InfoError):
+        await collect_info(FakeRunner(RunResult("", "x", 1)), dev(type="windows"))

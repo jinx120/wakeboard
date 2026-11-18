@@ -20,7 +20,7 @@ from jinja2 import Environment, FileSystemLoader
 
 from wakeboard.api import client_ip
 from wakeboard.auth import MIN_PASSWORD, SESSION_MAX_AGE, LockedOut
-from wakeboard.devices import (NAME_RE, RESERVED_NAMES, VALID_SHUTDOWN_MODES, VALID_TYPES, Device,
+from wakeboard.devices import (NAME_RE, RESERVED_NAMES, TYPE_ORDER, VALID_SHUTDOWN_MODES, VALID_TYPES, Device,
                                DuplicateDevice, UnknownDevice, valid_name)
 from wakeboard.service import (AuditUnavailable, ConfirmationRequired, InvalidRequest,
                                RunCommandDisabled, SelfTargetRefused)
@@ -124,6 +124,8 @@ def _q(v) -> str:
 def _env() -> Environment:
     env = Environment(loader=FileSystemLoader(str(_HERE / "templates")), autoescape=True)
     env.filters["uptime"] = _fmt_uptime
+    env.globals["types"] = TYPE_ORDER
+    env.globals["wol_presets"] = PRESETS
     env.filters["q"] = _q
     return env
 
@@ -161,7 +163,10 @@ def _parse_device(form, existing: Device | None) -> Device:
             raise FormError("Invalid broadcast address: must be an IPv4 address.") from None
     dtype = f("type") or "linux"
     if dtype not in VALID_TYPES:
-        raise FormError(f"Invalid type: choose one of {', '.join(sorted(VALID_TYPES))}.")
+        raise FormError(f"Invalid type: choose one of {', '.join(TYPE_ORDER)}.")
+    wol_method = f("wol_method") or "auto"
+    if wol_method not in PRESETS:
+        raise FormError("Invalid WoL method.")
     mode = f("shutdown_mode") or None
     if mode is not None and mode not in VALID_SHUTDOWN_MODES:
         raise FormError("Invalid shutdown mode.")
@@ -184,7 +189,7 @@ def _parse_device(form, existing: Device | None) -> Device:
                 "wake_test_result": existing.wake_test_result, "wake_test_at": existing.wake_test_at}
     try:
         return Device(name=name, host=host, ssh_user=user, ssh_port=port, mac=mac, broadcast=broadcast,
-                      type=dtype, groups=groups, shutdown_mode=mode, notes=notes,
+                      type=dtype, groups=groups, shutdown_mode=mode, notes=notes, wol_method=wol_method,
                       allow_run_command=form.get("allow_run_command") == "1",
                       bios_verified=form.get("bios_verified") == "1",
                       is_self=form.get("is_self") == "1", **keep)
@@ -489,7 +494,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         d = get_device(name)
         form = {"name": d.name, "host": d.host, "ssh_user": d.ssh_user, "ssh_port": d.ssh_port,
                 "mac": d.mac or "", "broadcast": d.broadcast or "", "type": d.type,
-                "groups": ", ".join(d.groups), "shutdown_mode": d.shutdown_mode, "notes": d.notes,
+                "groups": ", ".join(d.groups), "shutdown_mode": d.shutdown_mode, "wol_method": d.wol_method, "notes": d.notes, "wol_method": d.wol_method,
                 "allow_run_command": "1" if d.allow_run_command else "",
                 "bios_verified": "1" if d.bios_verified else "", "is_self": "1" if d.is_self else ""}
         return render(request, "device_form.html", device=d, form=form, editing=True)
@@ -501,7 +506,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         d = get_device(name)
         form = await request.form()
         confirm = form.get("confirm") == "1"
-        preset = str(form.get("preset") or "auto")
+        preset = str(form.get("preset") or (d.wol_method if action == "enable-wol" else "auto"))
         if action == "enable-wol" and preset not in PRESETS:  # whitelist, checked before anything else
             return result(request, f"enable WoL {d.name}", message="Unknown Wake-on-LAN preset.",
                           ok=False, status=400)

@@ -5,7 +5,10 @@ from dataclasses import dataclass, field
 
 from wakeboard.wol import normalize_mac
 
-VALID_TYPES = {"proxmox", "linux"}
+# Display order for forms; "linux" is the generic POSIX type. Everything except proxmox and
+# windows behaves like linux.
+TYPE_ORDER = ("linux", "debian", "ubuntu", "arch", "fedora", "proxmox", "windows")
+VALID_TYPES = set(TYPE_ORDER)
 
 
 class DuplicateDevice(Exception):
@@ -43,6 +46,7 @@ class Device:
     allow_run_command: bool = False
     shutdown_mode: str | None = None  # resolved in __post_init__ ("plain" / "graceful-proxmox")
     notes: str = ""
+    wol_method: str = "auto"  # a key of wolenable.PRESETS
     bios_verified: bool = False
     is_self: bool = False
     host_key_ack: bool = False
@@ -62,6 +66,9 @@ class Device:
             self.shutdown_mode = "graceful-proxmox" if self.type == "proxmox" else "plain"
         if self.shutdown_mode not in VALID_SHUTDOWN_MODES:
             raise ValueError(f"invalid shutdown_mode: {self.shutdown_mode!r}")
+        from wakeboard.wolenable import PRESETS  # late: wolenable imports this module
+        if self.wol_method not in PRESETS:
+            raise ValueError(f"invalid wol_method: {self.wol_method!r}")
         groups = [g.strip() for g in self.groups]
         if any("," in g for g in groups):
             raise ValueError("group names must not contain commas")
@@ -70,14 +77,14 @@ class Device:
 
 _COLS = ["name", "host", "ssh_user", "ssh_port", "mac", "broadcast", "type", "groups",
          "key_id", "allow_run_command", "shutdown_mode", "notes", "bios_verified", "is_self", "host_key_ack",
-         "wake_test_result", "wake_test_at"]
+         "wake_test_result", "wake_test_at", "wol_method"]
 
 
 def _values(d: Device) -> list:
     return [d.name, d.host, d.ssh_user, d.ssh_port, d.mac, d.broadcast, d.type,
             ",".join(d.groups), d.key_id, int(d.allow_run_command), d.shutdown_mode,
             d.notes, int(d.bios_verified), int(d.is_self), int(d.host_key_ack),
-            d.wake_test_result, d.wake_test_at]
+            d.wake_test_result, d.wake_test_at, d.wol_method]
 
 
 def _row(r: sqlite3.Row) -> Device:
@@ -88,7 +95,7 @@ def _row(r: sqlite3.Row) -> Device:
         allow_run_command=bool(r["allow_run_command"]), shutdown_mode=r["shutdown_mode"],
         notes=r["notes"], bios_verified=bool(r["bios_verified"]),
         is_self=bool(r["is_self"]), host_key_ack=bool(r["host_key_ack"]),
-        wake_test_result=r["wake_test_result"], wake_test_at=r["wake_test_at"], id=r["id"],
+        wake_test_result=r["wake_test_result"], wake_test_at=r["wake_test_at"], wol_method=r["wol_method"] or "auto", id=r["id"],
     )
 
 

@@ -18,13 +18,18 @@
     <label>SSH port <input name="ssh_port" type="number" min="1" max="65535" value="{{ form.ssh_port or 22 }}"></label>
     <label>Type
       <select name="type">
-        {% for t in ["linux", "proxmox"] %}<option value="{{ t }}"{% if (form.type or "linux") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}
+        {% for t in types %}<option value="{{ t }}"{% if (form.type or "linux") == t %} selected{% endif %}>{{ t }}</option>{% endfor %}
       </select>
     </label>
     <label>Shutdown mode
       <select name="shutdown_mode">
         <option value="">automatic (graceful for Proxmox)</option>
         {% for m in ["plain", "graceful-proxmox"] %}<option value="{{ m }}"{% if form.shutdown_mode == m %} selected{% endif %}>{{ m }}</option>{% endfor %}
+      </select>
+    </label>
+    <label>WoL method (used by "Enable WoL"; auto detects it)
+      <select name="wol_method">
+        {% for key, label in wol_presets.items() %}<option value="{{ key }}"{% if (form.wol_method or "auto") == key %} selected{% endif %}>{{ label }}</option>{% endfor %}
       </select>
     </label>
     <label>MAC address (optional; the WoL check can discover it)

@@ -15,16 +15,17 @@ class InfoError(Exception):
 
 @dataclass
 class Info:
-    uptime_s: int
-    load1: float
-    mem_used_pct: float
-    disk_root_pct: float
+    uptime_s: int | None
+    load1: float | None
+    mem_used_pct: float | None
+    disk_root_pct: float | None
     cpu_temp_c: float | None
-    kernel: str
+    kernel: str | None
     pve_version: str | None
     vms_running: int | None
     cts_running: int | None
     fetched_at: float
+    hostname: str | None = None  # only the minimal (Windows) info sets this
 
 
 # ---- probing ---------------------------------------------------------------
@@ -135,6 +136,13 @@ def parse_info(text: str, is_proxmox: bool) -> Info:
 
 
 async def collect_info(runner, device: Device) -> Info:
+    if device.type == "windows":  # the POSIX script cannot run there: reachable + hostname only
+        r = await runner.run(device, "hostname")
+        name = r.stdout.strip()
+        if r.exit != 0 or not name:
+            raise InfoError(f"info command failed (exit {r.exit}): {r.stderr.strip()[:200]}")
+        return Info(None, None, None, None, None, None, None, None, None,
+                    fetched_at=time.time(), hostname=name[:253])
     is_pve = device.type == "proxmox"
     r = await runner.run(device, info_command(is_pve))
     if r.exit != 0:

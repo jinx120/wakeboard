@@ -134,12 +134,14 @@ class Actions:
 
     @staticmethod
     def _priv(device: Device, cmd: str) -> str:
+        if device.type == "windows":
+            return cmd  # OpenSSH on Windows: no sudo
         return cmd if device.ssh_user == "root" else f"sudo -n {cmd}"
 
     async def _run_priv(self, device: Device, cmd: str, timeout: float = 30) -> RunResult:
         full = self._priv(device, cmd)
         r = await self.runner.run(device, full, timeout=timeout)
-        if device.ssh_user != "root":
+        if device.ssh_user != "root" and device.type != "windows":
             out = f"{r.stdout}\n{r.stderr}".lower()
             if "a password is required" in out or (r.exit != 0 and "sudo:" in out):
                 raise SudoRequired(
@@ -310,12 +312,17 @@ class Actions:
         def done() -> ActionResult:
             return ActionResult(ok=all(s.ok for s in stages), stages=stages)
 
+        if mode == "graceful-proxmox" and device.type != "proxmox":
+            self._emit(stages, progress, StageResult(
+                "mode", False, "graceful-proxmox shutdown is only valid for proxmox devices"))
+            return done()
         if not await self._precheck(device, stages, progress):
             return done()
         if mode == "graceful-proxmox" and not await self._stop_guests(device, stages, progress):
             return done()
 
-        ok, detail = await self._power_cmd(device, "shutdown -h now")
+        ok, detail = await self._power_cmd(
+            device, "shutdown /s /t 0" if device.type == "windows" else "shutdown -h now")
         if not self._emit(stages, progress, StageResult("shutdown", ok, detail)):
             return done()
         ok, detail = await self._wait_down(device)
@@ -438,7 +445,8 @@ class Actions:
 
         if not await self._precheck(device, stages, progress):
             return done()
-        ok, detail = await self._power_cmd(device, "reboot")
+        ok, detail = await self._power_cmd(
+            device, "shutdown /r /t 0" if device.type == "windows" else "reboot")
         if not self._emit(stages, progress, StageResult("reboot", ok, detail)):
             return done()
         # Confirm the transition: sustained down first, then up again.

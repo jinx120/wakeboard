@@ -823,3 +823,29 @@ async def test_guest_shutdown_error_leaves_no_task_running(cfg, clock):
     with pytest.raises(SudoRequired):
         await a.shutdown(pve(ssh_user="ops"))
     assert finished == [102]  # sibling ran to completion before the error surfaced
+
+
+def win(**kw):
+    return Device(name="w", host="10.0.0.7", mac="aa:bb:cc:dd:ee:07", type="windows", ssh_user="admin", **kw)
+
+
+@pytest.mark.parametrize("op,cmd", [("shutdown", "shutdown /s /t 0"), ("reboot", "shutdown /r /t 0")])
+async def test_windows_power_commands_have_no_sudo(cfg, clock, op, cmd):
+    r = FakeRunner()
+    a = mk(r, FakeProber(up=lambda: clock.t < 5), cfg, clock)
+    await getattr(a, op)(win())
+    assert r.cmds[0] == cmd and not any("sudo" in c for c in r.cmds)
+
+
+@pytest.mark.parametrize("t", ["debian", "ubuntu", "arch", "fedora"])
+async def test_posix_distros_behave_like_linux(cfg, clock, t):
+    r = FakeRunner()
+    a = mk(r, FakeProber(up=lambda: clock.t < 5), cfg, clock)
+    await a.shutdown(Device(name="b", host="h", type=t, ssh_user="u"))
+    assert r.cmds[0] == "sudo -n shutdown -h now"
+
+
+async def test_graceful_proxmox_rejected_for_non_proxmox(cfg, clock):
+    r = FakeRunner()
+    res = await mk(r, FakeProber(up=True), cfg, clock).shutdown(linux(), mode="graceful-proxmox")
+    assert not res.ok and r.cmds == []

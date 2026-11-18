@@ -38,6 +38,7 @@ MIGRATIONS: list[str] = [
     ALTER TABLE devices ADD COLUMN wake_test_result TEXT;
     ALTER TABLE devices ADD COLUMN wake_test_at REAL;
     """,
+    "ALTER TABLE devices ADD COLUMN wol_method TEXT NOT NULL DEFAULT 'auto';",
 ]
 
 

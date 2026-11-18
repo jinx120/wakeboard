@@ -301,7 +301,8 @@ def test_add_device_then_visible(authed):
     ("groups", "ok, bad group!", "group"),
     ("ssh_port", "99999", "port"),
     ("broadcast", "not-an-ip", "broadcast"),
-    ("type", "windows", "type"),
+    ("type", "macos", "type"),
+    ("wol_method", "bogus", "wol"),
 ])
 def test_add_device_validation_rerenders_form(authed, field, value, msg):
     data = {"name": "nas", "host": "10.0.0.20", "ssh_user": "root", "ssh_port": "22",
@@ -684,3 +685,41 @@ def test_enable_wol_confirm_rejects_groups_and_unknown(authed):
     c = authed["client"]
     assert c.get("/confirm/enable-wol?target=lab").status_code == 404
     assert c.get("/confirm/enable-wol?target=nope").status_code == 404
+
+
+def test_form_lists_all_types_and_wol_methods(authed):
+    from wakeboard.devices import VALID_TYPES
+    from wakeboard.wolenable import PRESETS
+    for url in ("/devices/new", "/devices/pve1/edit"):
+        page = authed["client"].get(url).text
+        for t in VALID_TYPES:
+            assert f'<option value="{t}"' in page
+        assert 'name="wol_method"' in page
+        for k in PRESETS:
+            assert f'<option value="{k}"' in page
+
+
+def test_add_windows_device_with_wol_method(authed):
+    r = post(authed, "/devices/new", {"name": "winbox", "host": "10.0.0.30", "ssh_user": "admin",
+                                      "ssh_port": "22", "type": "windows", "wol_method": "windows"},
+             follow_redirects=False)
+    assert r.status_code == 303
+    d = authed["repo"].get("winbox")
+    assert d.type == "windows" and d.wol_method == "windows" and d.shutdown_mode == "plain"
+    page = authed["client"].get("/devices/winbox").text
+    assert 'value="windows" selected' in page
+
+
+def test_edit_keeps_and_changes_wol_method(authed):
+    r = post(authed, "/devices/pve2/edit", {"name": "pve2", "host": "10.0.0.2", "ssh_user": "root",
+                                            "ssh_port": "22", "type": "linux", "wol_method": "ifupdown"},
+             follow_redirects=False)
+    assert r.status_code == 303 and authed["repo"].get("pve2").wol_method == "ifupdown"
+    assert 'value="ifupdown" selected' in authed["client"].get("/devices/pve2/edit").text
+
+
+def test_enable_wol_defaults_to_saved_method(authed):
+    calls = _fake_enable(authed)
+    d = authed["repo"].get("pve1"); d.wol_method = "ifupdown"; authed["repo"].update(d)
+    r = post(authed, "/devices/pve1/enable-wol", {"confirm": "1"})
+    assert r.status_code == 200 and calls == [("pve1", "ifupdown")]

@@ -432,6 +432,7 @@ class Service:
             "name": d.name, "host": d.host, "ssh_user": d.ssh_user, "ssh_port": d.ssh_port,
             "mac": d.mac, "broadcast": d.broadcast, "type": d.type, "groups": list(d.groups),
             "allow_run_command": d.allow_run_command, "shutdown_mode": d.shutdown_mode,
+            "wol_method": d.wol_method,
             "notes": d.notes, "bios_verified": d.bios_verified,
             "is_self": d.name in selfs, "host_key_ack": d.host_key_ack,
             "wake_test_result": d.wake_test_result, "wake_test_at": d.wake_test_at,

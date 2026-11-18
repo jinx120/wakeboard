@@ -79,8 +79,11 @@ Endpoints: `GET /devices`, `GET /devices/{target}/status`, `POST /wake`, `/shutd
 ## Adding a device
 
 **Add** a device with its name, host (IP or hostname), SSH user/port, MAC address
-(needed for wake), optional broadcast address, type (`linux` or `proxmox`), groups and
-shutdown mode (`plain` or `graceful-proxmox`). A user other than `root` needs passwordless
+(needed for wake), optional broadcast address, type (`linux`, `debian`, `ubuntu`, `arch`, `fedora`, `proxmox` or `windows`), WoL method
+(see below), groups and shutdown mode (`plain` or `graceful-proxmox`, the latter only for
+`proxmox`). Every type except `proxmox` and `windows` behaves like `linux`. `windows` needs
+the built-in OpenSSH server and an admin login: shutdown/reboot use `shutdown /s /t 0` and
+`shutdown /r /t 0` (no sudo), and the info panel shows only the hostname. A user other than `root` needs passwordless
 sudo (`NOPASSWD`) for `shutdown`, `reboot`, `qm`, `pct` and `pvesh`.
 
 Then enroll Wakeboard's SSH key on the device. The device page offers two methods:
@@ -132,6 +135,8 @@ else NetworkManager if it manages the NIC; else a systemd unit; else ifupdown), 
 (`/etc/network/interfaces.d/wakeboard-wol-<nic>`) and **Windows** (PowerShell
 `Set-NetAdapterPowerManagement`, adapter picked by MAC; disable Fast Startup too). Linux
 devices need passwordless sudo (`sudo -n`) or a root login; Windows needs an admin OpenSSH login.
+Each device stores a **WoL method** (default `auto`), set on the add/edit form; the device
+page preselects it and "Enable WoL" uses it when no method is posted.
 It is not exposed over MCP, since it changes the device's configuration.
 
 Also enable WoL in the BIOS/UEFI (often "Power On by PCI-E", "Wake on LAN" or "Remote

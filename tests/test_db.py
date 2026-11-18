@@ -21,3 +21,19 @@ def test_settings_from_env(monkeypatch, tmp_path):
     s = Settings.from_env()
     assert s.data_dir == Path(tmp_path)
     assert (s.poll_interval, s.wake_timeout, s.guest_timeout) == (30, 300, 120)
+
+
+def test_migration_adds_wol_method_keeping_data(tmp_path):
+    import sqlite3
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    for m in MIGRATIONS[:2]:       # the schema before wol_method existed
+        raw.executescript(m)
+    raw.execute("PRAGMA user_version = 2")
+    raw.execute("INSERT INTO devices (id, name, host, type) VALUES ('1','old','10.0.0.1','proxmox')")
+    raw.commit(); raw.close()
+    c = connect(path)
+    row = c.execute("SELECT * FROM devices").fetchone()
+    assert row["name"] == "old" and row["type"] == "proxmox" and row["wol_method"] == "auto"
+    from wakeboard.devices import DeviceRepo
+    assert DeviceRepo(c).get("old").wol_method == "auto"
