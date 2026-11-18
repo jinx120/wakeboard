@@ -209,3 +209,10 @@ docker build .
 The tests never power anything off. SSH goes to an in-process asyncssh server on
 127.0.0.1 that answers `shutdown`/`reboot` with a canned reply and never runs them. WoL
 packets go to a fake socket.
+
+## Native install (no Docker)
+
+Any Linux with Python >= 3.12 and `ping`: `./install.sh` creates a venv under
+`~/.local/share/wakeboard`, installs Wakeboard and a per-user systemd service
+(`systemctl --user status wakeboard`). Set `WAKEBOARD_PORT` / `WAKEBOARD_PASSWORD`
+before running to override the defaults. Tested on a Raspberry Pi 3B (aarch64).
