@@ -16,6 +16,10 @@ Vendored front-end: htmx 2.0.4 (`src/wakeboard/web/static/htmx.min.js`,
 sha256 `e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447`);
 see `src/wakeboard/web/static/VENDORED.txt`. The UI loads nothing from external hosts.
 
+<img width="923" height="336" alt="image" src="https://github.com/user-attachments/assets/bdae5261-b3fc-4678-83d5-cabd115f97d8" />
+
+<img width="852" height="243" alt="image" src="https://github.com/user-attachments/assets/089c2e1f-1ee1-4626-b67b-052bd4654f39" />
+
 ## Install on a Raspberry Pi 3B
 
 1. Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager. In the Imager
