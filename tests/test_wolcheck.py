@@ -346,3 +346,22 @@ async def test_wol_check_persistence_nic_whole_word_only():
                     "grep": ok("/etc/network/interfaces:post-up ethtool -s eno10 wol g")})
     rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
     assert rep.persistent is False
+
+
+@pytest.mark.asyncio
+async def test_wol_check_grep_exit2_with_matches_is_not_an_error():
+    """grep exits 2 when a listed path is missing; matches on stdout must still count."""
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
+                    "grep": RunResult("/etc/systemd/network/10-eno1.link:WakeOnLan=magic", "", 2)})
+    rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
+    assert rep.persistent is True
+    assert not any("could not check" in n for n in rep.notes)
+
+
+@pytest.mark.asyncio
+async def test_wol_check_recognises_wakeboard_systemd_unit():
+    r = FakeRunner({"ip -o link": ok(IP_LINK), "ethtool": ok(ethtool()),
+                    "grep": RunResult("/etc/systemd/system/wakeboard-wol@.service:wol g", "", 2),
+                    "is-enabled": ok("enabled\n")})
+    rep = await wol_check(r, dev(mac="aa:bb:cc:dd:ee:01"))
+    assert rep.persistent is True

@@ -126,14 +126,21 @@ async def wol_check(runner, device: Device) -> WolReport:
     pattern = "|".join(["wol", "wake-on", "wakeonlan", *ident])
     g = await runner.run(
         device, _priv(device, f"grep -rIsiE {shlex.quote(pattern)} {_PERSIST_PATHS}"))
-    if g.exit == 0:
+    # grep exits 2 when any listed path is missing (common) even if it found matches.
+    if g.exit == 0 or (g.exit == 2 and g.stdout.strip()):
         rep.persistent = _persists(g.stdout, ident)
-        if rep.persistent:
-            rep.notes.append("persistence is a config-file heuristic, not verified at boot")
-    elif g.exit == 1:
+    elif g.exit in (1, 2):
         rep.persistent = False
     else:
         rep.notes.append(f"could not check WoL persistence ({_short(g)})")
+    if not rep.persistent:
+        # Wakeboard's own systemd unit is enabled via a symlink grep does not follow.
+        u = await runner.run(
+            device, f"systemctl is-enabled {shlex.quote(f'wakeboard-wol@{nic}.service')}")
+        if u.exit == 0 and u.stdout.strip() == "enabled":
+            rep.persistent = True
+    if rep.persistent:
+        rep.notes.append("persistence is a config-file heuristic, not verified at boot")
     if rep.persistent is False and rep.supported:
         rep.notes.append("WoL setting does not appear to persist across reboots "
                          "(no wol config mentioning this NIC found in systemd/networkd/ifupdown)")
