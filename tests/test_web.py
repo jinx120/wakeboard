@@ -335,7 +335,7 @@ def test_unknown_device_is_404(authed):
     c = authed["client"]
     assert c.get("/devices/nope").status_code == 404
     assert c.get("/devices/nope/edit").status_code == 404
-    for a in ("wake", "shutdown", "reboot", "wol-check", "wake-test", "enroll", "ack-host-key", "delete"):
+    for a in ("wake", "shutdown", "reboot", "wol-check", "wake-test", "enable-wol", "enroll", "ack-host-key", "delete"):
         r = post(authed, f"/devices/nope/{a}", {"password": "x"})
         assert r.status_code == 404, a
     assert post(authed, "/devices/pve1/bogus").status_code == 404
@@ -625,3 +625,62 @@ def test_device_name_rules_apply_to_any_entry_path(authed):
     with pytest.raises(ValueError):
         Device(name="a/b", host="h")
     assert authed["repo"].get("all") is None
+
+
+# ---- enable WoL (persistent) -------------------------------------------------------
+
+def _fake_enable(authed):
+    from wakeboard.actions import ActionResult, StageResult
+    calls = []
+
+    async def fake(runner, d, preset):
+        calls.append((d.name, preset))
+        return ActionResult(True, [StageResult("detect", True, "x"), StageResult("verify", True, "g")]), None
+    authed["svc"]._enable_wol = fake
+    return calls
+
+
+def test_enable_wol_requires_auth_and_csrf(env):
+    r = env["client"].post("/devices/pve1/enable-wol", data={}, follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+
+
+def test_enable_wol_csrf_missing_is_403(authed):
+    calls = _fake_enable(authed)
+    r = authed["client"].post("/devices/pve1/enable-wol", data={"confirm": "1", "preset": "auto"})
+    assert r.status_code == 403 and calls == []
+
+
+def test_enable_wol_device_page_has_form(authed):
+    page = authed["client"].get("/devices/pve1").text
+    assert 'action="/devices/pve1/enable-wol"' in page and 'name="preset"' in page
+    assert 'value="systemd-unit"' in page and "Enable WoL (persistent)" in page
+
+
+def test_enable_wol_no_js_goes_through_confirm_page(authed):
+    calls = _fake_enable(authed)
+    r = post(authed, "/devices/pve1/enable-wol", {"preset": "ifupdown"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/confirm/enable-wol?target=pve1&preset=ifupdown" and calls == []
+    page = authed["client"].get(r.headers["location"])
+    assert page.status_code == 200 and 'name="preset" value="ifupdown"' in page.text
+    assert 'name="confirm" value="1"' in page.text
+    r = post(authed, "/devices/pve1/enable-wol", {"confirm": "1", "preset": "ifupdown"})
+    assert r.status_code == 200 and calls == [("pve1", "ifupdown")]
+    rows = authed["audit"].list()
+    assert any(x["action"] == "enable_wol" and "preset=ifupdown" in x["result"] for x in rows)
+
+
+def test_enable_wol_invalid_preset_rejected(authed):
+    calls = _fake_enable(authed)
+    for data in ({"preset": "bogus; reboot", "confirm": "1"}, {"preset": "bogus"}):
+        r = post(authed, "/devices/pve1/enable-wol", data, follow_redirects=False)
+        assert r.status_code == 400
+    assert authed["client"].get("/confirm/enable-wol?target=pve1&preset=bogus").status_code == 400
+    assert calls == []
+
+
+def test_enable_wol_confirm_rejects_groups_and_unknown(authed):
+    c = authed["client"]
+    assert c.get("/confirm/enable-wol?target=lab").status_code == 404
+    assert c.get("/confirm/enable-wol?target=nope").status_code == 404

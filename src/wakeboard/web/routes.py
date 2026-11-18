@@ -27,6 +27,7 @@ from wakeboard.service import (AuditUnavailable, ConfirmationRequired, InvalidRe
 from wakeboard.ssh import ConnectFailed, EnrollmentFailed, HostKeyChanged
 from wakeboard.targets import NoDevices, UnknownTarget, is_bulk, resolve_targets
 from wakeboard.wol import normalize_mac
+from wakeboard.wolenable import PRESETS
 
 log = logging.getLogger(__name__)
 
@@ -47,14 +48,14 @@ SECURITY_HEADERS = [
 
 _HERE = Path(__file__).parent
 _USER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]{0,31}$")
-DEVICE_ACTIONS = {"wake", "shutdown", "reboot", "wol-check", "wake-test", "enroll",
+DEVICE_ACTIONS = {"wake", "shutdown", "reboot", "wol-check", "wake-test", "enable-wol", "enroll",
                   "ack-host-key", "delete", "edit"}
 BULK_ACTIONS = {"wake", "shutdown", "reboot"}
 # actions that must be confirmed: bulk ones via the confirm page, device ones via hx-confirm
 # (HTMX) or, without JavaScript, the confirm page (a plain POST without confirm=1 is sent there)
 BULK_CONFIRM_ACTIONS = {"shutdown", "reboot"}
-DEVICE_CONFIRM_ACTIONS = {"shutdown", "reboot", "wake-test", "delete", "ack-host-key"}
-CONFIRM_VERBS = {"shutdown": "Shut down", "reboot": "Reboot", "wake-test": "Run the wake test on",
+DEVICE_CONFIRM_ACTIONS = {"shutdown", "reboot", "wake-test", "enable-wol", "delete", "ack-host-key"}
+CONFIRM_VERBS = {"shutdown": "Shut down", "reboot": "Reboot", "wake-test": "Run the wake test on", "enable-wol": "Enable Wake-on-LAN on",
                  "delete": "Remove", "ack-host-key": "Accept the new host key of"}
 
 
@@ -379,9 +380,13 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
     # -- confirm + bulk
 
     @r.get("/confirm/{action}")
-    async def confirm_page(request: Request, action: str, target: str = ""):
+    async def confirm_page(request: Request, action: str, target: str = "", preset: str = ""):
         if action not in DEVICE_CONFIRM_ACTIONS:
             raise WebError(404, "Not found.")
+        if action == "enable-wol" and preset not in PRESETS:
+            if preset:
+                raise WebError(400, "Unknown Wake-on-LAN preset.")
+            preset = "auto"
         try:
             members = resolve_targets(repo, target)
         except (UnknownTarget, NoDevices):
@@ -399,7 +404,8 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         return render(request, "confirm.html", action=action, verb=CONFIRM_VERBS[action],
                       target=target, bulk=bulk,
                       affected=affected, excluded=excluded, is_self=(not bulk and target in selfs),
-                      post_to=post_to)
+                      post_to=post_to, preset=preset if action == "enable-wol" else None,
+                      preset_label=PRESETS.get(preset))
 
     @r.post("/bulk/{action}")
     async def bulk(request: Request, action: str):
@@ -474,7 +480,7 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
             log.warning("key for %s unavailable: %s", d.name, type(e).__name__)
             enroll_cmd, pubkey = None, None
         selfs = {x["name"] for x in await service.list_devices() if x["is_self"]}
-        return render(request, "device.html", d=d, is_self=d.name in selfs, dev_status=status, info=info,
+        return render(request, "device.html", wol_presets=PRESETS, d=d, is_self=d.name in selfs, dev_status=status, info=info,
                       info_error=info_error, enroll_cmd=enroll_cmd, pubkey=pubkey,
                       history=_history(d.name))
 
@@ -495,6 +501,12 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
         d = get_device(name)
         form = await request.form()
         confirm = form.get("confirm") == "1"
+        preset = str(form.get("preset") or "auto")
+        if action == "enable-wol" and preset not in PRESETS:  # whitelist, checked before anything else
+            return result(request, f"enable WoL {d.name}", message="Unknown Wake-on-LAN preset.",
+                          ok=False, status=400)
+        if action == "enable-wol" and not confirm and not _is_hx(request):
+            return RedirectResponse(f"{confirm_url(action, d.name)}&preset={_q(preset)}", status_code=303)
         if action in DEVICE_CONFIRM_ACTIONS and not confirm and not _is_hx(request):
             # no JavaScript means no hx-confirm dialog ran: confirm on the server-rendered page
             return RedirectResponse(confirm_url(action, d.name), status_code=303)
@@ -510,6 +522,9 @@ def build_web_router(service, auth, *, keystore, runner, settings) -> APIRouter:
                                     confirm_url=confirm_url("reboot", d.name))
         if action == "wol-check":
             return await run_action(request, f"WoL check {d.name}", service.wake_check(d.name, caller=CALLER))
+        if action == "enable-wol":
+            return await run_action(request, f"enable WoL {d.name}",
+                                    service.enable_wol(d.name, caller=CALLER, preset=preset))
         if action == "wake-test":
             return await run_action(request, f"wake test {d.name}", service.wake_test(d.name, caller=CALLER))
         if action == "ack-host-key":

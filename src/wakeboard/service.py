@@ -23,7 +23,8 @@ from wakeboard.actions import LOCKED
 from wakeboard.ssh import ConnectFailed, HostKeyChanged, SudoRequired
 from wakeboard.status import InfoCache, collect_info as _collect_info
 from wakeboard.targets import NoDevices, UnknownTarget, is_bulk, resolve_targets
-from wakeboard.wolcheck import adopt_mac, wake_test as _wake_test, wol_check as _wol_check
+from wakeboard.wolenable import PRESETS, enable_wol as _enable_wol
+from wakeboard.wolcheck import adopt_mac, WolReport, wake_test as _wake_test, wol_check as _wol_check
 
 log = logging.getLogger(__name__)
 
@@ -312,6 +313,7 @@ class Service:
         self._local_ips, self._resolve = local_ips, resolve
         self._collect_info = collect_info
         self._wol_check = _wol_check
+        self._enable_wol = _enable_wol
         self._wake_test = _wake_test
         self._clock = clock
         self._self_cache: tuple[float, frozenset, frozenset] | None = None
@@ -535,6 +537,28 @@ class Service:
                     "mac_adopted": adopted, "stages": [asdict(StageResult("wol_check", True, detail))],
                     "error": None}
         return await self._run_each(devices, caller, "wake_check", fn)
+
+    async def enable_wol(self, target: str, caller: str, preset: str = "auto") -> dict:
+        """Persistently enable Wake-on-LAN on one device over SSH (mutates the remote system)."""
+        d = self._single(target, caller, "enable_wol")
+        if preset not in PRESETS:
+            self._audit(caller, d.name, "enable_wol", f"refused: unknown preset {str(preset)[:30]!r}")
+            raise InvalidRequest(f"unknown preset '{str(preset)[:30]}'; choose one of: {', '.join(PRESETS)}")
+        self._audit_attempt(caller, d.name, "enable_wol", None, [d], detail=f"preset={preset}")
+        try:
+            res, mac = await self._enable_wol(self.runner, d, preset)
+            out = _result_dict(res)
+            if mac and not d.mac:
+                with self.lock:  # re-read + set only mac, atomically w.r.t. other writers
+                    if adopt_mac(self.repo, d, WolReport(None, mac, False, "", None)):
+                        out["stages"].append(asdict(StageResult("adopt", True, f"adopted MAC {mac}")))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _log_failure("enable_wol", d.name, e)
+            out = _fail_dict(_err(e))
+        self._audit(caller, d.name, "enable_wol", f"preset={preset} {_summary(out)}"[:_AUDIT_MAX])
+        return {d.name: out}
 
     async def wake_test(self, target: str, caller: str) -> dict:
         """Shut down + wake one device and stamp the result (wolcheck audits outcomes)."""

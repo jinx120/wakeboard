@@ -98,6 +98,16 @@
             hx-confirm="Run wake test: this shuts {{ d.name }} down and wakes it again. Continue?">Run wake test</button>
     </form>
   </div>
+  <form method="post" action="{{ p }}/enable-wol">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Method
+      <select name="preset">{% for key, label in wol_presets.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}</select></label>
+    <button type="submit" class="danger" hx-post="{{ p }}/enable-wol" hx-target="#result"
+            hx-disabled-elt="this" hx-sync="this:drop"
+            hx-confirm="Enable Wake-on-LAN (persistent) on {{ d.name }}? This changes its network configuration over SSH.">Enable WoL (persistent)</button>
+    <p class="hint">Writes a persistent WoL setting on the device over SSH. Needs passwordless sudo
+      (or root/admin login). Auto picks the method for you.</p>
+  </form>
 </section>
 
 <section class="card">

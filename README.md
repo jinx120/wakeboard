@@ -121,6 +121,19 @@ To make it persist, use one of these:
   `post-up /usr/sbin/ethtool -s eth0 wol g`
 - NetworkManager: `nmcli connection modify <conn> 802-3-ethernet.wake-on-lan magic`
 
+### One-click: Enable WoL (persistent)
+
+The device page has an **Enable WoL (persistent)** button with a method dropdown. After a
+confirm page it applies WoL over SSH immediately, makes it survive reboots, then re-reads
+`ethtool` to verify `Wake-on: g`. It is idempotent. Methods: **Auto** (Windows if `ver` says so;
+else NetworkManager if it manages the NIC; else a systemd unit; else ifupdown), **systemd unit**
+(`wakeboard-wol@<nic>.service`), **NetworkManager** (`nmcli ... wake-on-lan magic`),
+**systemd-networkd** (`/etc/systemd/network/50-wakeboard-wol-<nic>.link`), **ifupdown**
+(`/etc/network/interfaces.d/wakeboard-wol-<nic>`) and **Windows** (PowerShell
+`Set-NetAdapterPowerManagement`, adapter picked by MAC; disable Fast Startup too). Linux
+devices need passwordless sudo (`sudo -n`) or a root login; Windows needs an admin OpenSSH login.
+It is not exposed over MCP, since it changes the device's configuration.
+
 Also enable WoL in the BIOS/UEFI (often "Power On by PCI-E", "Wake on LAN" or "Remote
 Wake Up"). On many Dell and HP desktops, **Deep Sleep Control** (or "ErP"/"EuP" low-power
 mode) cuts power to the NIC when the machine is off, so WoL silently fails even when the
